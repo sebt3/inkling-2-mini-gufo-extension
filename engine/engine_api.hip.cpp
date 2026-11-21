@@ -22,12 +22,14 @@ int GpuEngine::CreateSeq(std::string* error) { try { return impl_->e->create_seq
 void GpuEngine::DestroySeq(int seq) { impl_->e->destroy_seq(seq); }
 void GpuEngine::ResetSeq(int seq) { impl_->e->reset_sequence(seq); }
 
-bool GpuEngine::Append(int seq, const int* tokens, int n, int pos0, std::vector<float>* logits, std::string* error) {
+bool GpuEngine::Append(int seq, const int* tokens, int n, int pos0, std::vector<float>* logits, std::string* error, const int* embd_mask, const float* embd) {
   try {
     for (int o = 0; o < n; o += gpu::Engine::MAX_T) {
       const int m = std::min(gpu::Engine::MAX_T, n - o); gpu::Batch b;
       for (int i = 0; i < m; ++i) { b.tokens.push_back(tokens[o + i]); b.seq.push_back(seq); b.pos.push_back(pos0 + o + i); }
       if (o + m == n) b.want_logits.push_back(m - 1);
+      if (embd_mask) { bool any = false; for (int i = 0; i < m; ++i) any = any || embd_mask[o + i];
+        if (any) { b.embd_mask.assign(embd_mask + o, embd_mask + o + m); b.embd.assign(embd + (size_t)o * info_.n_embd, embd + (size_t)(o + m) * info_.n_embd); } }
       auto r = impl_->e->step(b); if (o + m == n && logits) *logits = std::move(r);
     }
     return true;
@@ -40,6 +42,12 @@ bool GpuEngine::DecodeBatch(const std::vector<int>& seqs, const std::vector<int>
     for (size_t i = 0; i < seqs.size(); ++i) (*logits)[i].assign(r.begin() + i * V, r.begin() + (i + 1) * V);
     return true;
   } catch (const std::exception& ex) { if (error) *error = ex.what(); return false; }
+}
+bool GpuEngine::LoadVision(const std::string& path, std::string* error) { try { impl_->e->load_vision(path); return true; } catch (const std::exception& ex) { if (error) *error = ex.what(); return false; } }
+bool GpuEngine::has_vision() const { return impl_->e->has_vision(); }
+int GpuEngine::vision_dim() const { return impl_->e->vision_dim(); }
+bool GpuEngine::EncodeImage(const std::vector<float>& planar, int W, int H, std::vector<float>* rows, int* n, std::string* error) {
+  try { *rows = impl_->e->encode_image(planar, W, H, n); return true; } catch (const std::exception& ex) { if (error) *error = ex.what(); return false; }
 }
 void GpuEngine::TransferRows(int seq, int slot, bool is_v, long first, long end, uint8_t* host, bool to_host) { impl_->e->transfer_rows(seq, slot, is_v, first, end, host, to_host); }
 void GpuEngine::ExportPrivate(int seq, uint8_t* out) { impl_->e->export_private(seq, out); }

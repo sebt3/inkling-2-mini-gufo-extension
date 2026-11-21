@@ -102,6 +102,11 @@ std::string render_messages(const std::vector<Message>& messages, const Options&
       rendered += header + kText + m.text + kEnd;
     } else if (m.content == Message::Content::Parts && !m.parts.empty()) {
       for (const auto& p : m.parts) {
+        if (p.type == "image") {
+          if (m.role != "user" && m.role != "tool") throw std::invalid_argument("Image content is only supported for user and tool messages");
+          rendered += header + "<|content_image|><|unused_200054|>" + kEnd;
+          continue;
+        }
         if (p.type != "text") throw std::invalid_argument("Unsupported content part type: " + p.type);
         rendered += header + kText + p.text + kEnd;
       }

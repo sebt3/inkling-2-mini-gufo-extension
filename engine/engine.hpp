@@ -11,6 +11,7 @@
 #include <vector>
 #include "../core/gguf.hpp"
 #include "kernels.hpp"
+#include "vision.hpp"
 
 namespace inkling::gpu {
 
@@ -31,6 +32,8 @@ struct Config {
 struct Batch {
   std::vector<int> tokens, seq, pos;
   std::vector<int> want_logits;  // indices (into the batch) of tokens whose logits are returned
+  std::vector<int> embd_mask;    // optional, size T: 1 where embd row t replaces the token embedding (images)
+  std::vector<float> embd;       // optional, T x n_embd
 };
 
 class Engine {
@@ -99,6 +102,10 @@ class Engine {
   }
   size_t weight_bytes() const { return weight_bytes_; }
   int max_ctx() const { return max_ctx_; }
+  void load_vision(const std::string& path) { vision_ = std::make_unique<Vision>(path); }
+  bool has_vision() const { return (bool)vision_; }
+  int vision_dim() const { return vision_ ? vision_->out_dim() : 0; }
+  std::vector<float> encode_image(const std::vector<float>& pix, int W, int H, int* n_tok) { std::lock_guard<std::mutex> lk(mu); return vision_->encode(pix, W, H, n_tok); }
   std::mutex mu;  // serialises step(): one device stream
   // INKLING_PROFILE=1: accumulated wall time per kernel group (synchronises after every group; for relative breakdowns only)
   bool prof_ = std::getenv("INKLING_PROFILE") != nullptr; std::map<std::string, std::pair<double, long>> prof_ms_;
@@ -126,12 +133,13 @@ class Engine {
   // per-sequence state
   struct SeqMem { bool used = false; int max_ctx = 0; std::vector<__half*> k, v; std::vector<float*> h; };
   SeqMem seqs_[MAXSEQ];
-  size_t weight_bytes_ = 0;
+  size_t weight_bytes_ = 0; std::unique_ptr<Vision> vision_;
   // pointer tables indexed by sequence: host mirrors and device copies, per slot (and slot*4+kind for histories)
   std::vector<std::vector<__half*>> kc_host_, vc_host_; std::vector<std::vector<float*>> hist_host_;
   std::vector<__half**> kc_tab_, vc_tab_; std::vector<float**> hist_tab_;
   // scratch (max batch)
   float *xn_[3], *q_, *k0_, *v0_, *r_, *sinks_, *gate_, *kd_, *vd_, *K_, *V_, *att_, *o_, *tmp_e_, *tmp_e2_, *logits_gate_, *moe_, *wts_, *hid_, *dn_, *ctrl_gate_, *ctrl_low_, *ctrl_a_, *ctrl_b_;
+  float* d_embd_ = nullptr; int* d_emask_ = nullptr;
   float *pm_, *pl_, *pacc_; int *forced_ = nullptr; int *ids_, *lists_, *counts_;
   int *d_tok_, *d_seq_, *d_pos_, *d_first_, *d_count_, *d_rows_; float* d_logit_in_; float* d_logits_;
   std::vector<float*> pool_; std::vector<int> pool_rc_;
@@ -203,7 +211,7 @@ class Engine {
     const int NSPLIT = 16; pm_ = dmalloc((size_t)T * c.n_head * NSPLIT); pl_ = dmalloc((size_t)T * c.n_head * NSPLIT); pacc_ = dmalloc((size_t)T * c.n_head * NSPLIT * 128);
     HIP_CHECK(hipMalloc(&ids_, (size_t)T * 8 * 4)); HIP_CHECK(hipMalloc(&forced_, (size_t)T * 8 * 4)); HIP_CHECK(hipMalloc(&lists_, (size_t)c.n_expert * T * 8 * 4)); HIP_CHECK(hipMalloc(&counts_, c.n_expert * 4));
     HIP_CHECK(hipMalloc(&d_tok_, T * 4)); HIP_CHECK(hipMalloc(&d_seq_, T * 4)); HIP_CHECK(hipMalloc(&d_pos_, T * 4)); HIP_CHECK(hipMalloc(&d_first_, MAXSEQ * 4)); HIP_CHECK(hipMalloc(&d_count_, MAXSEQ * 4));
-    HIP_CHECK(hipMalloc(&d_rows_, T * 4)); d_logit_in_ = dmalloc((size_t)T * E); d_logits_ = dmalloc((size_t)MAXSEQ * 4 * c.n_vocab_unpadded);
+    HIP_CHECK(hipMalloc(&d_rows_, T * 4)); d_embd_ = dmalloc((size_t)T * E); HIP_CHECK(hipMalloc(&d_emask_, T * 4)); d_logit_in_ = dmalloc((size_t)T * E); d_logits_ = dmalloc((size_t)MAXSEQ * 4 * c.n_vocab_unpadded);
   }
   void alloc_tables() {
     const int NS = c.n_slot(); kc_host_.assign(NS, std::vector<__half*>(MAXSEQ, nullptr)); vc_host_.assign(NS, std::vector<__half*>(MAXSEQ, nullptr)); hist_host_.assign(NS * 4, std::vector<float*>(MAXSEQ, nullptr));
@@ -339,6 +347,10 @@ inline std::vector<float> Engine::step(const Batch& b) {
   HIP_CHECK(hipMemcpy(d_count_, count.data(), MAXSEQ * 4, hipMemcpyHostToDevice));
   float* cur = pget();
   k_embed_norm<<<T, 256, (E + 256) * 4>>>(d_tok_, (const uint8_t*)tok_embd_.d, row_bytes_of(W_Q8_0, E), tok_norm_, cur, E, c.eps);
+  if (!b.embd_mask.empty()) {
+    HIP_CHECK(hipMemcpy(d_embd_, b.embd.data(), (size_t)T * E * 4, hipMemcpyHostToDevice)); HIP_CHECK(hipMemcpy(d_emask_, b.embd_mask.data(), T * 4, hipMemcpyHostToDevice));
+    k_embd_override<<<T, 256>>>(cur, d_embd_, d_emask_, E);
+  }
   dmp("inp_embd", -1, cur, E);
   std::vector<float*> blocks;
   auto adv = [&](float* nw) { pdec(cur); cur = nw; };

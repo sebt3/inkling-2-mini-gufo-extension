@@ -13,6 +13,7 @@
 #include <gufo/ext/sampling.hpp>
 #include <gufo/ext/text.hpp>
 #include <limits>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
@@ -23,7 +24,10 @@
 #include "../core/gguf.hpp"
 #include "../host/chat_template.hpp"
 #include "../host/tokenizer.hpp"
+#include <gufo/ext/sha256.hpp>
+#include "src/core/image.hpp"
 #include "continuation_adapter.hpp"
+#include "image_prep.hpp"
 #include "probe.hpp"
 #include "session.hpp"
 
@@ -49,6 +53,13 @@ std::vector<std::uint8_t> ProcessIdentityBytes(const void* engine, std::uint32_t
   const auto s = id.str(); return {s.begin(), s.end()};
 }
 
+// Image embeddings of a prompt: rows[k] holds the embeddings of the image whose placeholder tokens start at starts[k].
+struct ImageEmbedding { std::vector<float> rows; int n_tokens{0}; std::string hash; };
+struct PromptContext final : ext::TextPromptContext {
+  std::vector<std::size_t> starts;
+  std::vector<std::shared_ptr<const ImageEmbedding>> images;
+};
+
 class InklingState final : public ext::TextRunnerState {
  public:
   InklingState(Session& session, cache::Adapter& adapter, cache::Slot& slot) : session_(&session), adapter_(&adapter), slot_(&slot) {}
@@ -58,8 +69,11 @@ class InklingState final : public ext::TextRunnerState {
   void set_position(std::size_t p) noexcept { position_ = p; }
   bool thinking() const noexcept { return thinking_; }
   void set_thinking(bool v) noexcept { thinking_ = v; }
+  const PromptContext* context() const noexcept { return context_.get(); }
+  void set_context(std::shared_ptr<const ext::TextPromptContext> c) { context_ = std::static_pointer_cast<const PromptContext>(c); }
  private:
   Session* session_; cache::Adapter* adapter_; cache::Slot* slot_; std::size_t position_{0}; bool thinking_{false};
+  std::shared_ptr<const PromptContext> context_;
 };
 
 InklingState& Require(ext::TextRunnerState& s) { auto* p = dynamic_cast<InklingState*>(&s); if (!p) throw std::logic_error("text runner state is not Inkling"); return *p; }
@@ -90,6 +104,7 @@ class InklingTextRunner final : public ext::HipTextModelRunner {
     stop_ = tokenizer_->token_id("<|content_model_end_sampling|>");
     think_open_ = tokenizer_->token_id("<|content_thinking|>");
     end_message_ = tokenizer_->token_id("<|end_message|>");
+    image_pad_ = tokenizer_->token_id("<|unused_200054|>");
     hidden_ = {tokenizer_->token_id("<|message_model|>"), tokenizer_->token_id("<|content_text|>"), stop_};
   }
 
@@ -99,7 +114,7 @@ class InklingTextRunner final : public ext::HipTextModelRunner {
         .model_id = "Inkling-2-Mini",
         .state_abi = std::string(kStateAbi),
         .max_context = max_context_,
-        .capabilities = ext::TextRunnerCapabilities{.incremental_prefill = true, .final_token_advance_required = false, .incremental_text_is_exact = true, .prefix_reuse = true},
+        .capabilities = ext::TextRunnerCapabilities{.supports_vision = engine_->has_vision(), .incremental_prefill = true, .final_token_advance_required = false, .incremental_text_is_exact = true, .prefix_reuse = true},
         .sampling_defaults = sampling::TextSamplingDefaults{v, v, v},
     };
   }
@@ -141,18 +156,55 @@ class InklingTextRunner final : public ext::HipTextModelRunner {
   std::vector<TextRunnerToken> TokenizeControl(std::string_view text) const override { return ToTokens(tokenizer_->encode(std::string(text), true)); }
 
   std::optional<std::vector<TextRunnerToken>> RenderAndTokenize(const ext::ChatRequest& request) const override {
+    for (const auto& m : request.messages) if (!m.images.empty()) throw std::invalid_argument("image input requires PreparePrompt");
+    auto p = PreparePrompt(request); if (!p) return std::nullopt; return std::move(p->tokens);
+  }
+
+  std::optional<ext::TextPreparedPrompt> PreparePrompt(const ext::ChatRequest& request) const override {
     if (!request.tools.empty() && request.tool_choice != ext::ChatRequest::ToolChoice::kNone) throw std::invalid_argument("Inkling tool calls are not supported yet");
-    std::vector<::inkling::Message> messages;
+    std::vector<::inkling::Message> messages; std::vector<std::shared_ptr<const ImageEmbedding>> images;
     for (const auto& m : request.messages) {
-      if (!m.images.empty()) throw std::invalid_argument("Inkling image input is not supported yet");
       if (!m.tool_calls.empty()) throw std::invalid_argument("Inkling tool calls are not supported yet");
-      ::inkling::Message out = ::inkling::Message::make(RoleName(m.role), m.content + m.framing_suffix);
+      const std::string text = m.content + m.framing_suffix;
+      ::inkling::Message out;
+      if (m.images.empty()) out = ::inkling::Message::make(RoleName(m.role), text);
+      else {
+        if (!engine_->has_vision()) throw std::invalid_argument("this Inkling server was started without a vision projector (--mmproj)");
+        out.role = RoleName(m.role); out.content = ::inkling::Message::Content::Parts;
+        std::vector<const ext::ChatMessage::ImagePart*> order; for (const auto& im : m.images) order.push_back(&im);
+        std::stable_sort(order.begin(), order.end(), [](auto* a, auto* b) { return a->offset < b->offset; });
+        std::size_t pos = 0;
+        for (const auto* im : order) {
+          const std::size_t off = std::min(im->offset, m.content.size());
+          if (off > pos) { out.parts.push_back({"text", text.substr(pos, off - pos)}); pos = off; }
+          out.parts.push_back({"image", {}}); images.push_back(Embed(*im));
+        }
+        if (pos < text.size()) out.parts.push_back({"text", text.substr(pos)});
+      }
       out.reasoning_content = m.thought; out.name = m.name; messages.push_back(std::move(out));
     }
     ::inkling::Options options;
     if (request.reasoning.enabled.has_value() && !*request.reasoning.enabled) options.reasoning_effort = "none";
     else if (request.reasoning.effort.has_value()) options.reasoning_effort = EffortName(*request.reasoning.effort);
-    return ToTokens(tokenizer_->encode(::inkling::render_prompt(messages, options), true));
+    const std::vector<int> ids = tokenizer_->encode(::inkling::render_prompt(messages, options), true);
+    ext::TextPreparedPrompt prepared; auto ctx = std::make_shared<PromptContext>(); std::size_t k = 0;
+    for (int id : ids) {
+      if (id == image_pad_ && k < images.size()) {   // the placeholder of image k becomes one token per embedding row
+        ctx->starts.push_back(prepared.tokens.size()); ctx->images.push_back(images[k]);
+        for (int r = 0; r < images[k]->n_tokens; ++r) prepared.tokens.push_back((TextRunnerToken)id);
+        ++k;
+      } else prepared.tokens.push_back((TextRunnerToken)id);
+    }
+    if (k != images.size()) throw std::invalid_argument("image placeholders do not match the images of the request");
+    if (!images.empty()) {
+      std::string all;
+      for (std::size_t i = 0; i < images.size(); ++i) {
+        ctx->cache_prefixes.push_back({ctx->starts[i], std::vector<std::uint8_t>(all.begin(), all.end())});
+        all += images[i]->hash;
+      }
+      ctx->cache_identity.assign(all.begin(), all.end()); prepared.context = ctx;
+    }
+    return prepared;
   }
   std::string Decode(std::span<const TextRunnerToken> tokens) const override {
     std::vector<int> ids(tokens.begin(), tokens.end()); return tokenizer_->decode(ids);
@@ -162,6 +214,8 @@ class InklingTextRunner final : public ext::HipTextModelRunner {
   // answer stay out of the text, the two thinking markers are kept so the host can split reasoning from the answer.
   ReasoningTags ReasoningBudgetTags() const override { return {"<|content_thinking|>", "<|end_message|>", {"<|end_message|>"}}; }
   ReasoningMarkup ReasoningDelimiters() const override { return {"<|content_thinking|>", "<|end_message|>"}; }
+
+  void SetPromptContext(ext::TextRunnerState& state, std::shared_ptr<const ext::TextPromptContext> context) const override { Require(state).set_context(std::move(context)); }
 
   void PreparePrefixReuse(ext::TextRunnerState& state, std::span<const TextRunnerToken> prefix) const override {
     if (Require(state).position() != prefix.size()) throw std::logic_error("Inkling reused prefix does not match checkpoint");
@@ -174,8 +228,17 @@ class InklingTextRunner final : public ext::HipTextModelRunner {
     const std::size_t consumed = std::min<std::size_t>({max_input_tokens, prompt.size() - offset, kPrefillChunk});
     std::vector<std::int32_t> chunk; chunk.reserve(consumed);
     for (std::size_t i = 0; i < consumed; ++i) chunk.push_back((std::int32_t)prompt[offset + i]);
-    std::string error;
-    if (!s.session().Append(chunk, &error)) { s.Invalidate(); throw std::runtime_error("Inkling prefill failed: " + error); }
+    std::string error; std::vector<int> mask; std::vector<float> embd;
+    if (const PromptContext* pc = s.context()) {   // rows of the image embeddings that fall in this chunk
+      const std::size_t dim = (std::size_t)engine_->info().n_embd;
+      for (std::size_t k = 0; k < pc->starts.size(); ++k) {
+        const std::size_t a = pc->starts[k], b = a + (std::size_t)pc->images[k]->n_tokens; const std::size_t lo = std::max(a, offset), hi = std::min(b, offset + consumed);
+        if (lo >= hi) continue;
+        if (mask.empty()) { mask.assign(consumed, 0); embd.assign(consumed * dim, 0.f); }
+        for (std::size_t p = lo; p < hi; ++p) { mask[p - offset] = 1; std::memcpy(&embd[(p - offset) * dim], &pc->images[k]->rows[(p - a) * dim], dim * 4); }
+      }
+    }
+    if (!s.session().Append(chunk, &error, mask.empty() ? nullptr : mask.data(), embd.empty() ? nullptr : embd.data())) { s.Invalidate(); throw std::runtime_error("Inkling prefill failed: " + error); }
     s.set_position(offset + consumed);
     return {.consumed_tokens = consumed, .decode_ready = offset + consumed == prompt.size()};
   }
@@ -201,6 +264,16 @@ class InklingTextRunner final : public ext::HipTextModelRunner {
   std::size_t CheckpointPosition(const ext::TextRunnerState& state) const override { return Require(state).position(); }
 
  private:
+  // Encodes an image (cached by content hash: the host may prepare the same request more than once).
+  std::shared_ptr<const ImageEmbedding> Embed(const ext::ChatMessage::ImagePart& part) const {
+    const std::string hash = crypto::Sha256Hex(*part.bytes);
+    { const std::lock_guard lock(image_mutex_); for (const auto& e : image_cache_) if (e->hash == hash) return e; }
+    const core::Image img = core::DecodeImage(*part.bytes);
+    const PreparedImage prepared = PrepareImage(img.pixels.data(), (int)img.width, (int)img.height);
+    auto e = std::make_shared<ImageEmbedding>(); e->hash = hash; std::string error;
+    if (!engine_->EncodeImage(prepared.planar, prepared.width, prepared.height, &e->rows, &e->n_tokens, &error)) throw std::runtime_error("Inkling image encoding failed: " + error);
+    const std::lock_guard lock(image_mutex_); image_cache_.push_back(e); if (image_cache_.size() > 8) image_cache_.erase(image_cache_.begin()); return e;
+  }
   static std::vector<TextRunnerToken> ToTokens(const std::vector<int>& ids) { return std::vector<TextRunnerToken>(ids.begin(), ids.end()); }
   // Text of a generated token: structural markers of the answer are hidden, the thinking open/close markers are shown.
   std::string Piece(int token, bool thinking) const {
@@ -215,7 +288,8 @@ class InklingTextRunner final : public ext::HipTextModelRunner {
   std::uint32_t max_context_;
   cache::Identity identity_;
   int stop_{-1}, think_open_{-1}, end_message_{-1};
-  std::vector<int> hidden_;
+  std::vector<int> hidden_; int image_pad_{-1};
+  mutable std::mutex image_mutex_; mutable std::vector<std::shared_ptr<ImageEmbedding>> image_cache_;
 };
 
 }  // namespace
@@ -224,12 +298,12 @@ std::shared_ptr<ext::TextModelRunner> CreateInklingTextRunner(const ext::TextRun
   try {
     if (options.model_path.empty()) { if (error) *error = "Inkling requires a model path"; return nullptr; }
     if (options.speculative.backend != ext::TextSpeculativeBackend::kDisabled) { if (error) *error = "Inkling speculation is not supported yet"; return nullptr; }
-    if (!options.vision_model_path.empty()) { if (error) *error = "Inkling vision is not supported yet"; return nullptr; }
     std::uint32_t max_context = options.max_context ? options.max_context : kDefaultContext;
     max_context = std::min<std::uint32_t>(max_context, 1048576);
     std::string load_error;
     auto engine = ::inkling::GpuEngine::Load(options.model_path, (int)max_context, &load_error);
     if (!engine) { if (error) *error = "Failed to load Inkling: " + load_error; return nullptr; }
+    if (!options.vision_model_path.empty() && !engine->LoadVision(options.vision_model_path, &load_error)) { if (error) *error = "Failed to load the Inkling vision projector: " + load_error; return nullptr; }
     ::inkling::Gguf gguf(options.model_path);
     auto tokenizer = std::make_unique<::inkling::Tokenizer>(gguf);
     std::string fingerprint = options.disk_cache.model_artifact_fingerprint;

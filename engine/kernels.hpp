@@ -369,6 +369,8 @@ __global__ void k_moe_combine(const float* dn, const float* wts, float* out, int
 }
 __global__ void k_sigmoid_mul(float* att, const float* gate, int n) { const int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) att[i] *= 1.f / (1.f + expf(-gate[i])); }
 __global__ void k_softcap(float* x, int n, float cap) { const int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) x[i] = cap * tanhf(x[i] / cap); }
+// rows given as input embeddings (images) replace the token embedding, without the embedding norm
+__global__ void k_embd_override(float* X, const float* embd, const int* mask, int E) { const int t = blockIdx.x; if (!mask[t]) return; for (int i = threadIdx.x; i < E; i += blockDim.x) X[(size_t)t * E + i] = embd[(size_t)t * E + i]; }
 __global__ void k_gather_rows(const float* in, const int* rows, float* out, int E) { const int i = blockIdx.x; for (int c = threadIdx.x; c < E; c += blockDim.x) out[(size_t)i * E + c] = in[(size_t)rows[i] * E + c]; }
 
 }  // namespace inkling::gpu

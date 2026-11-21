@@ -25,10 +25,10 @@ class Session {
   std::span<const float> Logits() const { return logits_; }
   ::inkling::GpuEngine& engine() { return *engine_; }
 
-  bool Append(std::span<const std::int32_t> tokens, std::string* error) {
+  bool Append(std::span<const std::int32_t> tokens, std::string* error, const int* embd_mask = nullptr, const float* embd = nullptr) {
     if (tokens.empty()) return true;
     std::vector<float> lg;
-    if (!engine_->Append(seq_, tokens.data(), (int)tokens.size(), (int)position_, &lg, error)) return false;
+    if (!engine_->Append(seq_, tokens.data(), (int)tokens.size(), (int)position_, &lg, error, embd_mask, embd)) return false;
     logits_ = std::move(lg); position_ += tokens.size(); return true;
   }
   void Reset() { engine_->ResetSeq(seq_); position_ = 0; logits_.clear(); }

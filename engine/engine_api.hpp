@@ -32,7 +32,13 @@ class GpuEngine {
   void ResetSeq(int seq);
 
   // Feed `n` consecutive tokens of one sequence (positions pos0..pos0+n-1), in chunks; returns the logits of the last.
-  bool Append(int seq, const int* tokens, int n, int pos0, std::vector<float>* logits, std::string* error);
+  // embd_mask/embd (optional): for tokens with embd_mask[i] != 0 the row embd[i*n_embd ..) replaces the token embedding (images).
+  bool Append(int seq, const int* tokens, int n, int pos0, std::vector<float>* logits, std::string* error, const int* embd_mask = nullptr, const float* embd = nullptr);
+  // vision: load the projector (mmproj) once, then encode planar normalised [3][H][W] images (W and H multiples of 40)
+  bool LoadVision(const std::string& mmproj_path, std::string* error);
+  bool has_vision() const;
+  int vision_dim() const;
+  bool EncodeImage(const std::vector<float>& planar, int W, int H, std::vector<float>* rows, int* n_tokens, std::string* error);
   // One token for each of several sequences in a single pass; logits[i] belongs to seqs[i].
   bool DecodeBatch(const std::vector<int>& seqs, const std::vector<int>& tokens, const std::vector<int>& pos, std::vector<std::vector<float>>* logits, std::string* error);
 
