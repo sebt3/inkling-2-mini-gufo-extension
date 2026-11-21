@@ -25,7 +25,7 @@ int main(int argc, char** argv) {
     eng.force_experts = [&forced](int slot, const std::vector<int>& pos, std::vector<int>& out) { auto it = forced.find(slot); if (it == forced.end()) return false;
       for (int p : pos) for (int i = 0; i < 8; ++i) out.push_back((int)it->second[(size_t)p * 8 + i]); return true; };
   }
-  FILE* out = fopen(argv[3], "wb"); eng.reset_sequence(0);
+  FILE* out = fopen(argv[3], "wb"); const int sid = eng.create_seq(); if (sid != 0) return 3;
   t0 = std::chrono::steady_clock::now(); size_t done = 0;
   while (done < toks.size()) {
     Batch b; const size_t n = std::min<size_t>(chunk, toks.size() - done);

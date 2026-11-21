@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <functional>
 #include <map>
+#include <mutex>
 #include <memory>
 #include <string>
 #include <vector>
@@ -33,19 +34,70 @@ struct Batch {
 
 class Engine {
  public:
-  static constexpr int MAXSEQ = 8, LOCAL_CAP = 2048, MAX_T = 1024;
+  static constexpr int MAXSEQ = 16, LOCAL_CAP = 2048, MAX_T = 1024;
   Config c;
   // debugging: called with (name, slot, device pointer, tokens, width) at the dump points of the reference
   std::function<void(const char*, int, const float*, int, int)> dump;
   // optional teacher forcing: expert ids (T*8, token order of the batch) for a slot; return false to route normally
   std::function<bool(int, const std::vector<int>&, std::vector<int>&)> force_experts;
 
+  // max_ctx: default context of sequences created with create_seq(0). Weights are uploaded here.
   Engine(const std::string& path, int max_ctx) : g_(path), max_ctx_(max_ctx) { load_config(); upload(); alloc_scratch(); alloc_tables(); }
+  ~Engine() = default;
 
-  // reset the state of one sequence slot (zero convolution history; KV is overwritten as positions advance)
-  void reset_sequence(int s) {
-    for (int slot = 0; slot < c.n_slot(); ++slot) for (int k = 0; k < 4; ++k) HIP_CHECK(hipMemset(hist_[s][slot * 4 + k], 0, 3 * hist_ch(k) * 4));
+  // ---- sequences: independent KV caches and convolution histories, created on demand
+  int create_seq(int max_ctx = 0) {
+    max_ctx = max_ctx_;  // one context length per engine: the global KV capacity is a kernel argument
+    int id = -1; for (int i = 0; i < MAXSEQ; ++i) if (!seqs_[i].used) { id = i; break; }
+    if (id < 0) throw std::runtime_error("engine: no free sequence");
+    SeqMem& m = seqs_[id]; m.max_ctx = max_ctx; const int NS = c.n_slot(), KV = c.kv_dim();
+    m.k.assign(NS, nullptr); m.v.assign(NS, nullptr); m.h.assign(NS * 4, nullptr);
+    for (int slot = 0; slot < NS; ++slot) {
+      const int ip = slot < c.n_layer ? slot : c.loop_start + (slot - c.n_layer) % (c.loop_end - c.loop_start); const size_t cap = c.is_swa[ip] ? LOCAL_CAP : (size_t)max_ctx;
+      HIP_CHECK(hipMalloc(&m.k[slot], cap * KV * 2)); HIP_CHECK(hipMalloc(&m.v[slot], cap * KV * 2));
+      for (int kind = 0; kind < 4; ++kind) { HIP_CHECK(hipMalloc(&m.h[slot * 4 + kind], 3 * hist_ch(kind) * 4)); }
+      kc_host_[slot][id] = m.k[slot]; vc_host_[slot][id] = m.v[slot]; for (int kind = 0; kind < 4; ++kind) hist_host_[slot * 4 + kind][id] = m.h[slot * 4 + kind];
+    }
+    m.used = true; sync_tables(); reset_sequence(id); return id;
   }
+  void destroy_seq(int id) {
+    SeqMem& m = seqs_[id]; if (!m.used) return; const int NS = c.n_slot();
+    for (int slot = 0; slot < NS; ++slot) { hipFree(m.k[slot]); hipFree(m.v[slot]); for (int kind = 0; kind < 4; ++kind) hipFree(m.h[slot * 4 + kind]);
+      kc_host_[slot][id] = nullptr; vc_host_[slot][id] = nullptr; for (int kind = 0; kind < 4; ++kind) hist_host_[slot * 4 + kind][id] = nullptr; }
+    m = SeqMem{}; sync_tables();
+  }
+  // zero the convolution history (KV rows are simply overwritten as positions advance)
+  void reset_sequence(int s) {
+    for (int slot = 0; slot < c.n_slot(); ++slot) for (int k = 0; k < 4; ++k) HIP_CHECK(hipMemset(seqs_[s].h[slot * 4 + k], 0, 3 * hist_ch(k) * 4));
+  }
+  int seq_capacity(int slot, int s) const { const int ip = slot < c.n_layer ? slot : c.loop_start + (slot - c.n_layer) % (c.loop_end - c.loop_start); return c.is_swa[ip] ? LOCAL_CAP : seqs_[s].max_ctx; }
+  bool slot_is_local(int slot) const { const int ip = slot < c.n_layer ? slot : c.loop_start + (slot - c.n_layer) % (c.loop_end - c.loop_start); return c.is_swa[ip]; }
+  size_t row_bytes() const { return (size_t)c.kv_dim() * 2; }
+  // K or V rows [first, end) of a cache slot, absolute row numbers (ring for local slots); host buffer (end-first)*row_bytes
+  void transfer_rows(int s, int slot, bool is_v, long first, long end, uint8_t* host, bool to_host) {
+    const size_t rb = row_bytes(); const long cap = seq_capacity(slot, s); uint8_t* base = (uint8_t*)(is_v ? seqs_[s].v[slot] : seqs_[s].k[slot]);
+    for (long r = first; r < end;) {
+      const long idx = r % cap; const long n = std::min(end - r, cap - idx);
+      if (to_host) HIP_CHECK(hipMemcpy(host + (size_t)(r - first) * rb, base + (size_t)idx * rb, n * rb, hipMemcpyDeviceToHost));
+      else HIP_CHECK(hipMemcpy(base + (size_t)idx * rb, host + (size_t)(r - first) * rb, n * rb, hipMemcpyHostToDevice));
+      r += n;
+    }
+  }
+  // convolution histories of all cache slots, slot-major then kind (3 x channels floats each)
+  size_t private_bytes() const { size_t n = 0; for (int k = 0; k < 4; ++k) n += 3 * (size_t)hist_ch(k) * 4; return n * c.n_slot(); }
+  void export_private(int s, uint8_t* out) {
+    for (int slot = 0; slot < c.n_slot(); ++slot) for (int k = 0; k < 4; ++k) { const size_t b = 3 * (size_t)hist_ch(k) * 4; HIP_CHECK(hipMemcpy(out, seqs_[s].h[slot * 4 + k], b, hipMemcpyDeviceToHost)); out += b; }
+  }
+  void import_private(int s, const uint8_t* in) {
+    for (int slot = 0; slot < c.n_slot(); ++slot) for (int k = 0; k < 4; ++k) { const size_t b = 3 * (size_t)hist_ch(k) * 4; HIP_CHECK(hipMemcpy(seqs_[s].h[slot * 4 + k], in, b, hipMemcpyHostToDevice)); in += b; }
+  }
+  size_t seq_bytes(int max_ctx) const {
+    size_t n = 0; const size_t KV = c.kv_dim();
+    for (int slot = 0; slot < c.n_slot(); ++slot) { const int ip = slot < c.n_layer ? slot : c.loop_start + (slot - c.n_layer) % (c.loop_end - c.loop_start); n += (c.is_swa[ip] ? (size_t)LOCAL_CAP : (size_t)max_ctx) * KV * 2 * 2; }
+    return n + private_bytes();
+  }
+  size_t weight_bytes() const { return weight_bytes_; }
+  std::mutex mu;  // serialises step(): one device stream
 
   // run one batch; returns logits (n_vocab_unpadded each) for batch.want_logits
   std::vector<float> step(const Batch& b);
@@ -62,10 +114,12 @@ class Engine {
   std::vector<L> layers_;
   DTensor tok_embd_, output_; float *tok_norm_ = 0, *out_norm_ = 0, *out_res_ = 0;
   // per-sequence state
-  std::vector<std::vector<__half*>> kc_, vc_;     // [seq][slot]
-  std::vector<std::vector<float*>> hist_;         // [seq][slot*4+kind]
-  // device pointer tables indexed by sequence: [slot] -> float*[MAXSEQ]
-  std::vector<__half**> kc_tab_, vc_tab_; std::vector<float**> hist_tab_;  // hist_tab_[slot*4+kind]
+  struct SeqMem { bool used = false; int max_ctx = 0; std::vector<__half*> k, v; std::vector<float*> h; };
+  SeqMem seqs_[MAXSEQ];
+  size_t weight_bytes_ = 0;
+  // pointer tables indexed by sequence: host mirrors and device copies, per slot (and slot*4+kind for histories)
+  std::vector<std::vector<__half*>> kc_host_, vc_host_; std::vector<std::vector<float*>> hist_host_;
+  std::vector<__half**> kc_tab_, vc_tab_; std::vector<float**> hist_tab_;
   // scratch (max batch)
   float *xn_[3], *q_, *k0_, *v0_, *r_, *sinks_, *gate_, *kd_, *vd_, *K_, *V_, *att_, *o_, *tmp_e_, *tmp_e2_, *logits_gate_, *moe_, *wts_, *hid_, *dn_, *ctrl_gate_, *ctrl_low_, *ctrl_a_, *ctrl_b_;
   float *pm_, *pl_, *pacc_; int *forced_ = nullptr; int *ids_, *lists_, *counts_;
@@ -92,7 +146,7 @@ class Engine {
     throw std::runtime_error(std::string("engine: unsupported tensor type ") + type_name(t));
   }
   void* up(const void* src, size_t n) {
-    void* d; HIP_CHECK(hipMalloc(&d, n)); const size_t CH = 256u << 20;
+    void* d; HIP_CHECK(hipMalloc(&d, n)); weight_bytes_ += n; const size_t CH = 256u << 20;
     for (size_t o = 0; o < n; o += CH) HIP_CHECK(hipMemcpy((char*)d + o, (const char*)src + o, std::min(CH, n - o), hipMemcpyHostToDevice));
     return d;
   }
@@ -142,22 +196,17 @@ class Engine {
     HIP_CHECK(hipMalloc(&d_rows_, T * 4)); d_logit_in_ = dmalloc((size_t)T * E); d_logits_ = dmalloc((size_t)MAXSEQ * 4 * c.n_vocab_unpadded);
   }
   void alloc_tables() {
-    const int NS = c.n_slot(), KV = c.kv_dim(); kc_.assign(MAXSEQ, {}); vc_.assign(MAXSEQ, {}); hist_.assign(MAXSEQ, {});
-    for (int s = 0; s < MAXSEQ; ++s) {
-      for (int slot = 0; slot < NS; ++slot) {
-        const int ip = slot < c.n_layer ? slot : c.loop_start + (slot - c.n_layer) % (c.loop_end - c.loop_start); const size_t cap = c.is_swa[ip] ? LOCAL_CAP : max_ctx_;
-        __half *k, *v; HIP_CHECK(hipMalloc(&k, cap * KV * 2)); HIP_CHECK(hipMalloc(&v, cap * KV * 2)); kc_[s].push_back(k); vc_[s].push_back(v);
-        for (int kind = 0; kind < 4; ++kind) { float* h; HIP_CHECK(hipMalloc(&h, 3 * hist_ch(kind) * 4)); HIP_CHECK(hipMemset(h, 0, 3 * hist_ch(kind) * 4)); hist_[s].push_back(h); }
-      }
-    }
+    const int NS = c.n_slot(); kc_host_.assign(NS, std::vector<__half*>(MAXSEQ, nullptr)); vc_host_.assign(NS, std::vector<__half*>(MAXSEQ, nullptr)); hist_host_.assign(NS * 4, std::vector<float*>(MAXSEQ, nullptr));
     for (int slot = 0; slot < NS; ++slot) {
-      std::vector<__half*> k, v; for (int s = 0; s < MAXSEQ; ++s) { k.push_back(kc_[s][slot]); v.push_back(vc_[s][slot]); }
-      __half** dk; __half** dv; HIP_CHECK(hipMalloc(&dk, MAXSEQ * 8)); HIP_CHECK(hipMalloc(&dv, MAXSEQ * 8));
-      HIP_CHECK(hipMemcpy(dk, k.data(), MAXSEQ * 8, hipMemcpyHostToDevice)); HIP_CHECK(hipMemcpy(dv, v.data(), MAXSEQ * 8, hipMemcpyHostToDevice)); kc_tab_.push_back(dk); vc_tab_.push_back(dv);
-      for (int kind = 0; kind < 4; ++kind) {
-        std::vector<float*> h; for (int s = 0; s < MAXSEQ; ++s) h.push_back(hist_[s][slot * 4 + kind]);
-        float** dh; HIP_CHECK(hipMalloc(&dh, MAXSEQ * 8)); HIP_CHECK(hipMemcpy(dh, h.data(), MAXSEQ * 8, hipMemcpyHostToDevice)); hist_tab_.push_back(dh);
-      }
+      __half** dk; __half** dv; HIP_CHECK(hipMalloc(&dk, MAXSEQ * 8)); HIP_CHECK(hipMalloc(&dv, MAXSEQ * 8)); kc_tab_.push_back(dk); vc_tab_.push_back(dv);
+      for (int kind = 0; kind < 4; ++kind) { float** dh; HIP_CHECK(hipMalloc(&dh, MAXSEQ * 8)); hist_tab_.push_back(dh); }
+    }
+    sync_tables();
+  }
+  void sync_tables() {
+    for (int slot = 0; slot < c.n_slot(); ++slot) {
+      HIP_CHECK(hipMemcpy(kc_tab_[slot], kc_host_[slot].data(), MAXSEQ * 8, hipMemcpyHostToDevice)); HIP_CHECK(hipMemcpy(vc_tab_[slot], vc_host_[slot].data(), MAXSEQ * 8, hipMemcpyHostToDevice));
+      for (int kind = 0; kind < 4; ++kind) HIP_CHECK(hipMemcpy(hist_tab_[slot * 4 + kind], hist_host_[slot * 4 + kind].data(), MAXSEQ * 8, hipMemcpyHostToDevice));
     }
   }
 
@@ -167,7 +216,7 @@ class Engine {
   void pdec(float* p) { for (size_t i = 0; i < pool_.size(); ++i) if (pool_[i] == p) { --pool_rc_[i]; return; } }
 
   // ---- launch helpers
-  int T_ = 0, NSEQ_ = 0, maxpos_ = 0; std::vector<int> pos_h_;
+  int T_ = 0, NSEQ_ = 0, maxpos_ = 0, step_cap_ = 0; std::vector<int> pos_h_;
   template <int WT> void gemm_t(const DTensor& W, const float* X, float* Y, int T, int N) {
     constexpr int NT = 4; dim3 grid((N + 7) / 8, (T + NT - 1) / NT);
     k_gemm<WT, NT><<<grid, 256>>>((const uint8_t*)W.d, W.K, N, X, Y, T, nullptr, nullptr, nullptr);
@@ -219,7 +268,7 @@ inline float* Engine::layer(int slot, int ip, float* cur, std::vector<float*>& b
   k_clip<<<T * NH, 128>>>(r_, c.n_rel, Ly.rel_clip, NH, c.rel_clip);
   if (!swa) k_tau<<<T, 256>>>(q_, NH * D, r_, NH * c.n_rel, d_pos_, (float)c.log_floor, c.log_alpha);
   dmp("Qcur", slot, q_, NH * D); dmp("Kcur", slot, K_, KV); dmp("Vcur", slot, V_, KV);
-  const int cap = swa ? LOCAL_CAP : max_ctx_;
+  const int cap = swa ? LOCAL_CAP : step_cap_;
   k_kv_store<<<T, 128>>>(K_, V_, kc_tab_[slot], vc_tab_[slot], d_seq_, d_pos_, cap, KV);
   int nsplit = 1, chunk = 1 << 30;
   if (!swa) { const int len = maxpos_ + 1; chunk = std::max(2048, (len + 15) / 16); nsplit = (len + chunk - 1) / chunk; }
@@ -263,7 +312,8 @@ inline float* Engine::layer(int slot, int ip, float* cur, std::vector<float*>& b
 
 inline std::vector<float> Engine::step(const Batch& b) {
   const int T = (int)b.tokens.size(), E = c.n_embd; if (T > MAX_T) throw std::runtime_error("batch too large");
-  T_ = T; pos_h_ = b.pos; maxpos_ = 0; for (int p : b.pos) maxpos_ = std::max(maxpos_, p);
+  std::lock_guard<std::mutex> lk(mu);
+  T_ = T; pos_h_ = b.pos; maxpos_ = 0; step_cap_ = max_ctx_; for (int p : b.pos) maxpos_ = std::max(maxpos_, p);
   std::vector<int> first(MAXSEQ, 0), count(MAXSEQ, 0);
   for (int t = 0; t < T; ++t) { const int s = b.seq[t]; if (count[s] == 0) first[s] = t; count[s]++; }
   HIP_CHECK(hipMemcpy(d_tok_, b.tokens.data(), T * 4, hipMemcpyHostToDevice)); HIP_CHECK(hipMemcpy(d_seq_, b.seq.data(), T * 4, hipMemcpyHostToDevice));
