@@ -7,17 +7,19 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 POD=${POD:-inkling-dev}; NS=kydah-llms
+# TREE selects the synced copy on the node and the build dir in the pod (several worktrees can coexist)
+TREE=${TREE:-src}; BUILD=/tmp/build-$TREE
 case "${1:-}" in
-  sync) tar --exclude=.git --exclude=build -cf - . | ssh infra-worker04 'rm -rf /var/tmp/inkling-ext/src && mkdir -p /var/tmp/inkling-ext/src && tar -xf - -C /var/tmp/inkling-ext/src' ;;
-  run) shift; { cat tools/env.sh; cat; } | ssh infra-m1 "sudo -i kubectl -n $NS exec -i $POD -c dev -- bash -s" ;;
+  sync) tar --exclude=.git --exclude=build -cf - . | ssh infra-worker04 'rm -rf /var/tmp/inkling-ext/$TREE && mkdir -p /var/tmp/inkling-ext/$TREE && tar -xf - -C /var/tmp/inkling-ext/$TREE' ;;
+  run) shift; { cat tools/env.sh; echo "export TREE=$TREE BUILD=$BUILD SRC=/src/$TREE"; cat; } | ssh infra-m1 "sudo -i kubectl -n $NS exec -i $POD -c dev -- bash -s" ;;
   build-ref) "$0" run <<'X'
-cd /src/src && mkdir -p /tmp/build && g++ -O3 -march=native -fopenmp -std=c++20 -o /tmp/build/inkling_ref tools/inkling_ref.cpp 2>&1 | head -40
-ls -la /tmp/build/inkling_ref
+cd $SRC && mkdir -p $BUILD && g++ -O3 -march=native -fopenmp -std=c++20 -o $BUILD/inkling_ref tools/inkling_ref.cpp 2>&1 | head -40
+ls -la $BUILD/inkling_ref
 X
   ;;
   build-oracle-dump) "$0" run <<'X'
-cd /src/src && g++ -O2 -std=c++17 -o /tmp/build/oracle_dump tools/oracle_dump.cpp -I/src/llama.cpp/include -I/src/llama.cpp/ggml/include -L/tmp/llbuild/bin -lllama -lggml -lggml-base -Wl,-rpath,/tmp/llbuild/bin 2>&1 | head -20
-ls -la /tmp/build/oracle_dump
+cd $SRC && mkdir -p $BUILD && g++ -O2 -std=c++17 -o $BUILD/oracle_dump tools/oracle_dump.cpp -I/src/llama.cpp/include -I/src/llama.cpp/ggml/include -L/tmp/llbuild/bin -lllama -lggml -lggml-base -Wl,-rpath,/tmp/llbuild/bin 2>&1 | head -20
+ls -la $BUILD/oracle_dump
 X
   ;;
   *) echo "usage: $0 sync|run|build-ref|build-oracle-dump"; exit 2 ;;
