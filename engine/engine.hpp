@@ -13,6 +13,7 @@
 #include "kernels.hpp"
 #include "wmma.hpp"
 #include "flash.hpp"
+#include "decode.hpp"
 #include "vision.hpp"
 
 namespace inkling::gpu {
@@ -189,8 +190,24 @@ class Engine {
     for (size_t o = 0; o < n; o += CH) HIP_CHECK(hipMemcpy((char*)d + o, (const char*)src + o, std::min(CH, n - o), hipMemcpyHostToDevice));
     return d;
   }
+  // Q8_0 / NVFP4 rows are repacked to the planar layout (see row_bytes_of); everything else is uploaded as is
   DTensor dt(const Tensor* t) {
-    DTensor d; d.wt = wtype(t->type); d.K = (int)t->ne[0]; d.N = t->ne.size() > 1 ? (int)t->ne[1] : 1; d.NE = t->ne.size() > 2 ? (int)t->ne[2] : 1; d.d = up(t->data, t->nbytes()); return d;
+    DTensor d; d.wt = wtype(t->type); d.K = (int)t->ne[0]; d.N = t->ne.size() > 1 ? (int)t->ne[1] : 1; d.NE = t->ne.size() > 2 ? (int)t->ne[2] : 1;
+    if (d.wt == W_Q8_0 || d.wt == W_NVFP4) {
+      const size_t rows = (size_t)d.N * d.NE, K = d.K, srb = t->row_bytes(), drb = row_bytes_of(d.wt, d.K);
+      const size_t CH = 4096; void* dev; HIP_CHECK(hipMalloc(&dev, rows * drb)); weight_bytes_ += rows * drb; std::vector<uint8_t> buf(CH * drb);
+      for (size_t r0 = 0; r0 < rows; r0 += CH) {
+        const size_t n = std::min(CH, rows - r0); std::fill(buf.begin(), buf.begin() + n * drb, 0);
+        for (size_t i = 0; i < n; ++i) {
+          const uint8_t* src = t->data + (r0 + i) * srb; uint8_t* dst = buf.data() + i * drb;
+          if (d.wt == W_Q8_0) for (size_t b = 0; b < K / 32; ++b) { memcpy(dst + K + b * 2, src + b * 34, 2); memcpy(dst + b * 32, src + b * 34 + 2, 32); }
+          else for (size_t b = 0; b < K / 64; ++b) { memcpy(dst + K / 2 + b * 4, src + b * 36, 4); memcpy(dst + b * 32, src + b * 36 + 4, 32); }
+        }
+        HIP_CHECK(hipMemcpy((uint8_t*)dev + r0 * drb, buf.data(), n * drb, hipMemcpyHostToDevice));
+      }
+      d.d = dev; return d;
+    }
+    d.d = up(t->data, t->nbytes()); return d;
   }
   float* f32v(const Tensor* t) { if (!t) return nullptr; if (t->type != T_F32) throw std::runtime_error("expected F32 tensor " + t->name); return (float*)up(t->data, t->nbytes()); }
 
@@ -257,7 +274,8 @@ class Engine {
   void pdec(float* p) { for (size_t i = 0; i < pool_.size(); ++i) if (pool_[i] == p) { --pool_rc_[i]; return; } }
 
   // ---- launch helpers
-  int T_ = 0, NSEQ_ = 0, maxpos_ = 0, step_cap_ = 0; std::vector<int> pos_h_;
+  struct GraphRec { hipGraphExec_t exec = nullptr; bool warm = false; }; std::map<int, GraphRec> graphs_; bool graphs_on_ = std::getenv("INKLING_NO_GRAPH") == nullptr;
+  std::chrono::steady_clock::time_point step_t0_; int T_ = 0, NSEQ_ = 0, maxpos_ = 0, step_cap_ = 0; std::vector<int> pos_h_;
   template <int WT> void gemm_t(const DTensor& W, const float* X, float* Y, int T, int N) {
     constexpr int NT = 4; dim3 grid((N + 7) / 8, (T + NT - 1) / NT);
     k_gemm<WT, NT><<<grid, 256>>>((const uint8_t*)W.d, W.K, N, X, Y, T, nullptr, nullptr, nullptr);
@@ -265,7 +283,7 @@ class Engine {
   template <int WT> void gemm_wmma(const DTensor& W, const float* X, float* Y, int T, int N) {
     k_wmma_gemm<WT><<<dim3((N + 63) / 64, (T + 63) / 64), 128>>>((const uint8_t*)W.d, W.K, N, X, Y, N, T, nullptr, nullptr, 1.f);
   }
-  bool use_wmma = std::getenv("INKLING_NO_WMMA") == nullptr; bool use_flash_ = std::getenv("INKLING_NO_FLASH") == nullptr; bool single_seq_ = false; int d_seq0_ = 0;
+  bool use_wmma = std::getenv("INKLING_NO_WMMA") == nullptr; bool use_flash_ = std::getenv("INKLING_NO_FLASH") == nullptr; bool fast_decode_ = std::getenv("INKLING_NO_FUSE") == nullptr; bool single_seq_ = false; int d_seq0_ = 0;
   // exact: keep the scalar f32 path (the router: a rounding there would flip expert choices)
   void gemm(const DTensor& W, const float* X, float* Y, int T, int N = -1, bool exact = false) {
     if (N < 0) N = W.N;
@@ -282,7 +300,14 @@ class Engine {
     timed("mix", [&] { k_mix<<<T_, 256>>>(a, query, c.n_embd, c.eps); });
   }
   float* control(float* cur, float* msg, const L& Ly, int ctrl) {
-    const int E = c.n_embd, R = c.gate_rank; float* out = pget(); const int n = T_ * E;
+    const int E = c.n_embd, R = c.gate_rank;
+    if (fast_decode_ && T_ == 1 && !dump) {
+      float* out = pget();
+      timed("control", [&] { k_control_gate<<<1, 256>>>(cur, msg, ctrl_gate_, E, c.eps);
+        GJobs J{}; J.n = 1; J.j[0] = {(const uint8_t*)Ly.c_down[ctrl].d, ctrl_gate_, ctrl_low_, W_F32, 2 * E, R}; k_multi_gemv<<<(R + 7) / 8, 256>>>(J);
+        k_control2<<<(E + 127) / 128, 128>>>(cur, msg, ctrl_low_, (const float*)Ly.c_gain[ctrl].d, (const float*)Ly.c_forget[ctrl].d, out, E, R); });
+      return out;
+    } float* out = pget(); const int n = T_ * E;
     timed("control", [&] { k_control_gate<<<T_, 256>>>(cur, msg, ctrl_gate_, E, c.eps);
       gemm(Ly.c_down[ctrl], ctrl_gate_, ctrl_low_, T_); gemm(Ly.c_gain[ctrl], ctrl_low_, ctrl_a_, T_); gemm(Ly.c_forget[ctrl], ctrl_low_, ctrl_b_, T_);
       k_control_apply<<<(n + 255) / 256, 256>>>(cur, msg, ctrl_a_, ctrl_b_, out, n); });
@@ -292,8 +317,8 @@ class Engine {
     dim3 g((ch + 127) / 128, T_);
     k_conv<<<g, 128>>>(x, w, dyn, dyn ? c.n_head_kv : 0, d_seq_, d_pos_, d_first_, hist_tab_[slot * 4 + kind], out, T_, ch);
     if (save_conv_) {  // single-sequence verification batch: keep the old history and the inputs
-      HIP_CHECK(hipMemcpy(osave_[slot * 4 + kind], hist_host_[slot * 4 + kind][save_seq_], (size_t)3 * ch * 4, hipMemcpyDeviceToDevice));
-      HIP_CHECK(hipMemcpy(vsave_[slot * 4 + kind], x, (size_t)T_ * ch * 4, hipMemcpyDeviceToDevice));
+      HIP_CHECK(hipMemcpyAsync(osave_[slot * 4 + kind], hist_host_[slot * 4 + kind][save_seq_], (size_t)3 * ch * 4, hipMemcpyDeviceToDevice, hipStreamPerThread));
+      HIP_CHECK(hipMemcpyAsync(vsave_[slot * 4 + kind], x, (size_t)T_ * ch * 4, hipMemcpyDeviceToDevice, hipStreamPerThread));
     }
     dim3 g2((ch + 127) / 128, MAXSEQ); k_conv_state<<<g2, 128>>>(x, d_first_, d_count_, hist_tab_[slot * 4 + kind], ch);
   }
@@ -316,17 +341,29 @@ inline float* Engine::layer(int slot, int ip, float* cur, std::vector<float*>& b
   if (swa) { rms(in[0], Ly.attn_norm, x0, T); if (msgs) { rms(in[1], Ly.attn_norm, x1, T); rms(in[2], Ly.attn_norm, x2, T); } else { x1 = x0; x2 = x0; } }
   else { rms(in[0], Ly.q_inp, x0, T); rms(in[1], Ly.k_inp, x1, T); rms(in[2], Ly.v_inp, x2, T); }
   for (float* m : owned) pdec(m);
+  const bool fast = fast_decode_ && T == 1 && !dump && !force_experts;
+  if (fast) timed("proj_qkv_rel_gate", [&] {
+    GJobs J{}; auto add = [&](const DTensor& W, const float* X, float* Y) { J.j[J.n++] = {(const uint8_t*)W.d, X, Y, W.wt, W.K, W.N}; };
+    add(Ly.wq, x0, q_); add(Ly.wk, x1, k0_); add(Ly.wv, x2, v0_); add(Ly.rel, x0, r_); add(Ly.sink, x0, sinks_); add(Ly.gate, x0, gate_); if (!swa) { add(Ly.kcp, x1, kd_); add(Ly.vcp, x2, vd_); }
+    int nb = 0; for (int i = 0; i < J.n; ++i) nb += (J.j[i].N + 7) / 8; k_multi_gemv<<<nb, 256>>>(J); });
+  else
   timed("proj_qkv_rel_gate", [&] { gemm(Ly.wq, x0, q_, T); gemm(Ly.wk, x1, k0_, T); gemm(Ly.wv, x2, v0_, T); gemm(Ly.rel, x0, r_, T); gemm(Ly.sink, x0, sinks_, T); gemm(Ly.gate, x0, gate_, T);
     if (!swa) { gemm(Ly.kcp, x1, kd_, T); gemm(Ly.vcp, x2, vd_, T); } });
+  const int cap = swa ? LOCAL_CAP : step_cap_;
+  if (fast) {
+    timed("conv_kv", [&] { CJobs J{}; J.n = 2; J.j[0] = {k0_, Ly.k_conv, swa ? nullptr : kd_, hist_tab_[slot * 4 + 0], K_, nullptr, KV, NKV}; J.j[1] = {v0_, Ly.v_conv, swa ? nullptr : vd_, hist_tab_[slot * 4 + 1], V_, nullptr, KV, NKV};
+      k_conv1<<<2 * ((KV + 127) / 128), 128>>>(J, d_seq_); });
+    timed("clip_norm_tau", [&] { k_post1<<<NH + 2 * NKV + NH, 128>>>(q_, K_, V_, r_, Ly.q_clip, Ly.rel_clip, kc_tab_[slot], vc_tab_[slot], d_seq_, d_pos_, NH, NKV, c.n_rel, c.qk_clip, c.rel_clip, c.eps, swa ? 0 : 1, (float)c.log_floor, c.log_alpha, swa ? LOCAL_CAP : max_ctx_); });
+  } else {
   timed("conv_kv", [&] { conv(k0_, Ly.k_conv, swa ? nullptr : kd_, slot, 0, K_, KV); conv(v0_, Ly.v_conv, swa ? nullptr : vd_, slot, 1, V_, KV); });
   timed("clip_norm_tau", [&] { k_clip<<<T * NH, 128>>>(q_, D, Ly.q_clip, NH, c.qk_clip); k_clip<<<T * NKV, 128>>>(K_, D, nullptr, NKV, c.qk_clip); k_rms_head<<<T * NKV, 128>>>(V_, D, c.eps);
     k_clip<<<T * NH, 128>>>(r_, c.n_rel, Ly.rel_clip, NH, c.rel_clip);
     if (!swa) k_tau<<<T, 256>>>(q_, NH * D, r_, NH * c.n_rel, d_pos_, (float)c.log_floor, c.log_alpha); });
   dmp("Qcur", slot, q_, NH * D); dmp("Kcur", slot, K_, KV); dmp("Vcur", slot, V_, KV);
-  const int cap = swa ? LOCAL_CAP : step_cap_;
   timed("kv_store", [&] { k_kv_store<<<T, 128>>>(K_, V_, kc_tab_[slot], vc_tab_[slot], d_seq_, d_pos_, cap, KV); });
+  }
   int nsplit = 1, chunk = 1 << 30;
-  if (!swa) { const int len = maxpos_ + 1; chunk = std::max(2048, (len + 15) / 16); nsplit = (len + chunk - 1) / chunk; }
+  if (!swa) { nsplit = 16; chunk = 0; }   // chunk = max(2048, ceil(len / 16)) is computed per token inside the kernel
   else { chunk = c.n_swa; nsplit = 1; }
   const bool flash = use_flash_ && T >= 16 && single_seq_;
   if (flash) {
@@ -344,10 +381,17 @@ inline float* Engine::layer(int slot, int ip, float* cur, std::vector<float*>& b
   });
   }
   timed("wo_conv", [&] { gemm(Ly.wo, att_, o_, T); });
+  if (fast) {   // conv + history + residual in one launch (the first layer of a block starts a new stream: no residual)
+    const bool start = ip % c.block == 0; float* A = pget(); CJobs J{}; J.n = 1; J.j[0] = {o_, Ly.post_conv, nullptr, hist_tab_[slot * 4 + 2], A, start ? nullptr : inpSA, E, 0};
+    timed("wo_conv", [&] { k_conv1<<<(E + 127) / 128, 128>>>(J, d_seq_); });
+    if (start) { blocks.push_back(inpSA); pinc(inpSA); }
+    cur = A;
+  } else {
   float* A = pget(); timed("wo_conv", [&] { conv(o_, Ly.post_conv, nullptr, slot, 2, A, E); });
   dmp("attn_out", slot, A, E);
   if (ip % c.block == 0) { blocks.push_back(inpSA); pinc(inpSA); cur = A; }
   else { float* C = pget(); const int n = T * E; k_add<<<(n + 255) / 256, 256>>>(inpSA, A, C, n); pdec(A); cur = C; }
+  }
   float* ffn_inp = cur; dmp("ffn_inp", slot, ffn_inp, E);
   std::vector<float*> fm; mix(blocks, cur, Ly.ffn_res, 1, fm); float* xm = fm[0];
   if (msgs) { float* o = control(xm, (*msgs)[3], *loop, 3); pdec(xm); xm = o; }
@@ -356,10 +400,12 @@ inline float* Engine::layer(int slot, int ip, float* cur, std::vector<float*>& b
   const int NE = c.n_expert, NF = c.n_ff_exp, npairs = T * 8;
   timed("moe_route", [&] {
   gemm(Ly.gate_inp, tmp_e_, logits_gate_, T, -1, true);
+  if (fast) { k_route_lists1<<<1, 128>>>(logits_gate_, Ly.probs_b, NE, 8, c.w_scale, ids_, wts_, lists_, counts_, npairs); } else {
   const int* forced = nullptr;
   if (force_experts) { std::vector<int> f; if (force_experts(slot, pos_h_, f) && (int)f.size() == T * 8) { HIP_CHECK(hipMemcpy(forced_, f.data(), f.size() * 4, hipMemcpyHostToDevice)); forced = forced_; } }
   k_route<<<T, 128>>>(logits_gate_, Ly.probs_b, NE, 8, c.w_scale, ids_, wts_, forced);
   k_moe_lists<<<NE, 256>>>(ids_, npairs, lists_, counts_);
+  }
   });
   timed("moe_experts", [&] {
   if (use_wmma && T >= 32) {   // grouped matrix-core GEMMs: ~64 tokens per expert tile
@@ -383,8 +429,9 @@ inline float* Engine::layer(int slot, int ip, float* cur, std::vector<float*>& b
   k_moe_combine<<<T, 256>>>(dn_, wts_, moe_, 8, E);
   if (dump) { HIP_CHECK(hipDeviceSynchronize()); std::vector<int> hid(T * 8); HIP_CHECK(hipMemcpy(hid.data(), ids_, T * 8 * 4, hipMemcpyDeviceToHost)); std::vector<float> f(hid.begin(), hid.end()); HIP_CHECK(hipMemcpy(tmp_e2_, f.data(), f.size() * 4, hipMemcpyHostToDevice)); dump("ffn_moe_topk", slot, tmp_e2_, T, 8); }
   dmp("ffn_moe_out", slot, moe_, E);
-  float* out = pget(); conv(moe_, Ly.ffn_post_conv, nullptr, slot, 3, tmp_e_, E);
-  { const int n = T * E; k_add<<<(n + 255) / 256, 256>>>(ffn_inp, tmp_e_, out, n); }
+  float* out = pget();
+  if (fast) { CJobs J{}; J.n = 1; J.j[0] = {moe_, Ly.ffn_post_conv, nullptr, hist_tab_[slot * 4 + 3], out, ffn_inp, E, 0}; k_conv1<<<(E + 127) / 128, 128>>>(J, d_seq_); }
+  else { conv(moe_, Ly.ffn_post_conv, nullptr, slot, 3, tmp_e_, E); const int n = T * E; k_add<<<(n + 255) / 256, 256>>>(ffn_inp, tmp_e_, out, n); }
   pdec(ffn_inp);  // the caller keeps its own reference to the layer input; ffn_inp is either A (owned) or C (owned)
   dmp("l_out", slot, out, E);
   return out;
@@ -392,11 +439,12 @@ inline float* Engine::layer(int slot, int ip, float* cur, std::vector<float*>& b
 
 inline std::vector<float> Engine::step(const Batch& b) {
   const int T = (int)b.tokens.size(), E = c.n_embd; if (T > MAX_T) throw std::runtime_error("batch too large");
-  std::lock_guard<std::mutex> lk(mu);
+  std::lock_guard<std::mutex> lk(mu); step_t0_ = std::chrono::steady_clock::now();
   single_seq_ = true; d_seq0_ = b.seq.empty() ? 0 : b.seq[0]; for (int i = 0; i < T; ++i) if (b.seq[i] != d_seq0_ || (i && b.pos[i] != b.pos[i - 1] + 1)) { single_seq_ = false; break; }
   save_conv_ = b.save_conv; save_seq_ = b.seq.empty() ? 0 : b.seq[0]; save_T_ = T;
   if (save_conv_ && T > 16) throw std::runtime_error("engine: verification batches have at most 16 tokens");
   const bool capf = b.capture_features; int app = 0;
+  (void)0;
   static const int shift = std::getenv("DS_TAP_SHIFT") ? std::atoi(std::getenv("DS_TAP_SHIFT")) : 0;  // experiment: taps at 5+s, 23+s, 41+s
   auto tap = [&](float* x) { if (capf && (app == 5 + shift || app == 23 + shift || app == 41 + shift)) k_copy_cols<<<T_, 256>>>(x, d_feat_, c.n_embd, 4, app == 5 + shift ? 0 : app == 23 + shift ? 1 : 2); ++app; };
   T_ = T; pos_h_ = b.pos; maxpos_ = 0; step_cap_ = max_ctx_; for (int p : b.pos) maxpos_ = std::max(maxpos_, p);
@@ -405,48 +453,62 @@ inline std::vector<float> Engine::step(const Batch& b) {
   HIP_CHECK(hipMemcpy(d_tok_, b.tokens.data(), T * 4, hipMemcpyHostToDevice)); HIP_CHECK(hipMemcpy(d_seq_, b.seq.data(), T * 4, hipMemcpyHostToDevice));
   HIP_CHECK(hipMemcpy(d_pos_, b.pos.data(), T * 4, hipMemcpyHostToDevice)); HIP_CHECK(hipMemcpy(d_first_, first.data(), MAXSEQ * 4, hipMemcpyHostToDevice));
   HIP_CHECK(hipMemcpy(d_count_, count.data(), MAXSEQ * 4, hipMemcpyHostToDevice));
-  float* cur = pget();
-  k_embed_norm<<<T, 256, (E + 256) * 4>>>(d_tok_, (const uint8_t*)tok_embd_.d, row_bytes_of(W_Q8_0, E), tok_norm_, cur, E, c.eps);
+  const int nl = (int)b.want_logits.size(); std::vector<float> res((size_t)nl * c.n_vocab_unpadded);
+  if (nl) HIP_CHECK(hipMemcpy(d_rows_, b.want_logits.data(), nl * 4, hipMemcpyHostToDevice));
   if (!b.embd_mask.empty()) {
     HIP_CHECK(hipMemcpy(d_embd_, b.embd.data(), (size_t)T * E * 4, hipMemcpyHostToDevice)); HIP_CHECK(hipMemcpy(d_emask_, b.embd_mask.data(), T * 4, hipMemcpyHostToDevice));
-    k_embd_override<<<T, 256>>>(cur, d_embd_, d_emask_, E);
   }
-  dmp("inp_embd", -1, cur, E);
-  std::vector<float*> blocks;
-  auto adv = [&](float* nw) { pdec(cur); cur = nw; };
-  for (int il = 0; il < c.loop_start; ++il) { tap(cur); adv(layer(il, il, cur, blocks, nullptr, nullptr)); }
-  float* prelude = cur; pinc(prelude); std::vector<float*> prelude_blocks = blocks; for (float* p : prelude_blocks) pinc(p);
-  const int core = c.loop_end - c.loop_start;
-  for (int pass = 0; pass < c.n_passes; ++pass) {
-    std::vector<float*> bank; float* bank_out = nullptr;
-    if (pass > 0) {
-      bank.assign(blocks.begin() + prelude_blocks.size() + 1, blocks.end()); for (float* p : bank) pinc(p);
-      bank_out = cur; pinc(bank_out);
-      for (float* p : blocks) pdec(p);          // drop the previous pass's block list
-      blocks = prelude_blocks; for (float* p : blocks) pinc(p);
-      pdec(cur); cur = prelude; pinc(cur);
+  float* cur = nullptr; float* prelude = nullptr; std::vector<float*> blocks, prelude_blocks;
+  auto body = [&]() {
+    app = 0; cur = pget();
+    k_embed_norm<<<T, 256, (E + 256) * 4>>>(d_tok_, (const uint8_t*)tok_embd_.d, row_bytes_of(W_Q8_0, E), tok_norm_, cur, E, c.eps);
+    if (!b.embd_mask.empty()) k_embd_override<<<T, 256>>>(cur, d_embd_, d_emask_, E);
+    dmp("inp_embd", -1, cur, E);
+    auto adv = [&](float* nw) { pdec(cur); cur = nw; };
+    for (int il = 0; il < c.loop_start; ++il) { tap(cur); adv(layer(il, il, cur, blocks, nullptr, nullptr)); }
+    prelude = cur; pinc(prelude); prelude_blocks = blocks; for (float* p : prelude_blocks) pinc(p);
+    const int core = c.loop_end - c.loop_start;
+    for (int pass = 0; pass < c.n_passes; ++pass) {
+      std::vector<float*> bank; float* bank_out = nullptr;
+      if (pass > 0) {
+        bank.assign(blocks.begin() + prelude_blocks.size() + 1, blocks.end()); for (float* p : bank) pinc(p);
+        bank_out = cur; pinc(bank_out);
+        for (float* p : blocks) pdec(p);
+        blocks = prelude_blocks; for (float* p : blocks) pinc(p);
+        pdec(cur); cur = prelude; pinc(cur);
+      }
+      for (int ip = c.loop_start; ip < c.loop_end; ++ip) {
+        const int slot = pass == 0 ? ip : c.n_layer + (pass - 1) * core + (ip - c.loop_start);
+        tap(cur);
+        if (pass == 0) { adv(layer(slot, ip, cur, blocks, nullptr, nullptr)); continue; }
+        std::vector<float*> msgs; mix(bank, bank_out, layers_[ip].msg_query, 4, msgs);
+        float* nw = layer(slot, ip, cur, blocks, &msgs, &layers_[ip]); for (float* m : msgs) pdec(m); adv(nw);
+      }
+      if (pass > 0) { for (float* p : bank) pdec(p); pdec(bank_out); }
     }
-    for (int ip = c.loop_start; ip < c.loop_end; ++ip) {
-      const int slot = pass == 0 ? ip : c.n_layer + (pass - 1) * core + (ip - c.loop_start);
-      tap(cur);
-      if (pass == 0) { adv(layer(slot, ip, cur, blocks, nullptr, nullptr)); continue; }
-      std::vector<float*> msgs; mix(bank, bank_out, layers_[ip].msg_query, 4, msgs);
-      float* nw = layer(slot, ip, cur, blocks, &msgs, &layers_[ip]); for (float* m : msgs) pdec(m); adv(nw);
+    for (int il = c.loop_end; il < c.n_layer; ++il) { tap(cur); adv(layer(il, il, cur, blocks, nullptr, nullptr)); }
+    std::vector<float*> om; mix(blocks, cur, out_res_, 1, om); rms(om[0], out_norm_, tmp_e_, T); pdec(om[0]);
+    if (capf) k_copy_cols<<<T_, 256>>>(tmp_e_, d_feat_, E, 4, 3);
+    dmp("result_norm", -1, tmp_e_, E);
+    if (nl) {
+      k_gather_rows<<<nl, 256>>>(tmp_e_, d_rows_, d_logit_in_, E);
+      timed("lm_head", [&] { gemm(output_, d_logit_in_, d_logits_, nl, c.n_vocab_unpadded); });
+      const int n = nl * c.n_vocab_unpadded; k_softcap<<<(n + 255) / 256, 256>>>(d_logits_, n, c.softcap);
     }
-    if (pass > 0) { for (float* p : bank) pdec(p); pdec(bank_out); }
-  }
-  for (int il = c.loop_end; il < c.n_layer; ++il) { tap(cur); adv(layer(il, il, cur, blocks, nullptr, nullptr)); }
-  std::vector<float*> om; mix(blocks, cur, out_res_, 1, om); rms(om[0], out_norm_, tmp_e_, T); pdec(om[0]);
-  if (capf) k_copy_cols<<<T_, 256>>>(tmp_e_, d_feat_, E, 4, 3);
-  dmp("result_norm", -1, tmp_e_, E);
-  // logits for the requested rows
-  const int nl = (int)b.want_logits.size(); std::vector<float> res((size_t)nl * c.n_vocab_unpadded);
-  if (nl) {
-    HIP_CHECK(hipMemcpy(d_rows_, b.want_logits.data(), nl * 4, hipMemcpyHostToDevice)); k_gather_rows<<<nl, 256>>>(tmp_e_, d_rows_, d_logit_in_, E);
-    timed("lm_head", [&] { gemm(output_, d_logit_in_, d_logits_, nl, c.n_vocab_unpadded); });
-    const int n = nl * c.n_vocab_unpadded; k_softcap<<<(n + 255) / 256, 256>>>(d_logits_, n, c.softcap);
-    HIP_CHECK(hipMemcpy(res.data(), d_logits_, res.size() * 4, hipMemcpyDeviceToHost));
-  }
+  };
+  // Decode-sized batches replay a captured graph: the ~1900 kernel launches of a step cost more CPU time than the GPU needs to run them.
+  const bool eligible = graphs_on_ && T <= 16 && !dump && !force_experts && b.embd_mask.empty() && !prof_;
+  if (eligible) {
+    const int key = T | (nl << 8) | ((capf ? 1 : 0) << 16) | ((b.save_conv ? 1 : 0) << 17); GraphRec& g = graphs_[key];
+    if (g.exec) { HIP_CHECK(hipGraphLaunch(g.exec, hipStreamPerThread)); }
+    else if (g.warm) {   // second run of this shape: capture (pool buffers exist now, addresses are stable)
+      HIP_CHECK(hipStreamBeginCapture(hipStreamPerThread, hipStreamCaptureModeGlobal)); body();
+      hipGraph_t gr; HIP_CHECK(hipStreamEndCapture(hipStreamPerThread, &gr)); HIP_CHECK(hipGraphInstantiate(&g.exec, gr, nullptr, nullptr, 0)); HIP_CHECK(hipGraphDestroy(gr));
+      HIP_CHECK(hipGraphLaunch(g.exec, hipStreamPerThread));
+    } else { body(); g.warm = true; }
+  } else body();
+  if (nl) HIP_CHECK(hipMemcpy(res.data(), d_logits_, res.size() * 4, hipMemcpyDeviceToHost));
+  if (std::getenv("INKLING_ENQ")) { static double enq = 0; static long n = 0; enq += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - step_t0_).count(); if (++n % 20 == 0) fprintf(stderr, "[enqueue] mean %.2f ms per step (CPU time to queue the work)\n", enq / n); }
   HIP_CHECK(hipDeviceSynchronize());
   // release everything still held by this batch
   pdec(cur); pdec(prelude); for (float* p : blocks) pdec(p); for (float* p : prelude_blocks) pdec(p);

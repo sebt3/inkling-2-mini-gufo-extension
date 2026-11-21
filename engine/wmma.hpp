@@ -23,7 +23,7 @@ __global__ __launch_bounds__(128) void k_wmma_gemm(const uint8_t* __restrict__ W
   for (int k0 = 0; k0 < K; k0 += WT_BK) {
     if (tid < 64) {  // weights: one row, 32 elements
       const int n = n0 + tid; _Float16* dst = &As[tid * WT_PAD];
-      if (n < N) { float w[32]; dq32<WT>(W + (size_t)n * rb, k0 / 32, w); for (int i = 0; i < 32; ++i) dst[i] = (_Float16)w[i]; }
+      if (n < N) { float w[32]; dq32<WT>(W + (size_t)n * rb, k0 / 32, w, K); for (int i = 0; i < 32; ++i) dst[i] = (_Float16)w[i]; }
       else for (int i = 0; i < 32; ++i) dst[i] = (_Float16)0.f;
     } else {          // activations: one token, 32 elements
       const int ti = tid - 64, m = m0 + ti; _Float16* dst = &Bs[ti * WT_PAD];
@@ -60,7 +60,7 @@ __global__ __launch_bounds__(128) void k_wmma_moe_gate_up(const uint8_t* __restr
   for (int k0 = 0; k0 < K; k0 += WT_BK) {
     if (tid < 64) {
       const int n = f0 + (tid & 31); _Float16* dst = &As[tid * WT_PAD];
-      if (n < NF) { const size_t row = (size_t)e * 2 * NF + (tid < 32 ? n : NF + n); float w[32]; dq32<WT>(W + row * rb, k0 / 32, w); for (int i = 0; i < 32; ++i) dst[i] = (_Float16)w[i]; }
+      if (n < NF) { const size_t row = (size_t)e * 2 * NF + (tid < 32 ? n : NF + n); float w[32]; dq32<WT>(W + row * rb, k0 / 32, w, K); for (int i = 0; i < 32; ++i) dst[i] = (_Float16)w[i]; }
       else for (int i = 0; i < 32; ++i) dst[i] = (_Float16)0.f;
     } else {
       const int ti = tid - 64, m = m0 + ti; _Float16* dst = &Bs[ti * WT_PAD];
@@ -98,7 +98,7 @@ __global__ __launch_bounds__(128) void k_wmma_moe_down(const uint8_t* __restrict
   const int tid = threadIdx.x, wave = tid >> 5, lane = tid & 31, wy = wave >> 1, wx = wave & 1; const int n0 = blockIdx.x * WT_BN, m0 = blockIdx.y * WT_BM; const size_t rb = row_bytes_of(WT, K);
   float8 acc[2][2]; for (int i = 0; i < 2; ++i) for (int j = 0; j < 2; ++j) acc[i][j] = (float8){0, 0, 0, 0, 0, 0, 0, 0};
   for (int k0 = 0; k0 < K; k0 += WT_BK) {
-    if (tid < 64) { const int n = n0 + tid; _Float16* dst = &As[tid * WT_PAD]; if (n < N) { float w[32]; dq32<WT>(We + (size_t)n * rb, k0 / 32, w); for (int i = 0; i < 32; ++i) dst[i] = (_Float16)w[i]; } else for (int i = 0; i < 32; ++i) dst[i] = (_Float16)0.f; }
+    if (tid < 64) { const int n = n0 + tid; _Float16* dst = &As[tid * WT_PAD]; if (n < N) { float w[32]; dq32<WT>(We + (size_t)n * rb, k0 / 32, w, K); for (int i = 0; i < 32; ++i) dst[i] = (_Float16)w[i]; } else for (int i = 0; i < 32; ++i) dst[i] = (_Float16)0.f; }
     else { const int ti = tid - 64, m = m0 + ti; _Float16* dst = &Bs[ti * WT_PAD];
       if (m < cnt) { const float* x = hid + (size_t)pl[m] * K + k0; for (int i = 0; i < 32; i += 4) { const float4 v = *(const float4*)(x + i); dst[i] = (_Float16)v.x; dst[i + 1] = (_Float16)v.y; dst[i + 2] = (_Float16)v.z; dst[i + 3] = (_Float16)v.w; } }
       else for (int i = 0; i < 32; ++i) dst[i] = (_Float16)0.f; }

@@ -42,5 +42,9 @@ cd $SRC && mkdir -p $BUILD && clang++ $HIPFLAGS -O2 -std=c++20 -Wno-unused-resul
 ls -la $BUILD/wmma_test
 X
   ;;
-  *) echo "usage: $0 sync|run|build-ref|build-oracle-dump|build-gpu|build-vision|build-spec|build-wmma"; exit 2 ;;
+  build-launch) "$0" run <<'X'
+cd $SRC && mkdir -p $BUILD && clang++ $HIPFLAGS -O2 -std=c++20 -Wno-unused-result tools/launch_bench.cpp -o $BUILD/launch_bench 2>&1 | grep -E "error" -A5 | head
+X
+  ;;
+  *) echo "usage: $0 sync|run|build-ref|build-oracle-dump|build-gpu|build-vision|build-spec|build-wmma|build-launch"; exit 2 ;;
 esac

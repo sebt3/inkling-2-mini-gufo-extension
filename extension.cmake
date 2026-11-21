@@ -38,6 +38,7 @@ if(TARGET gufo_inkling_hip)
   target_compile_definitions(gufo_inkling_hip PRIVATE ENGINE_ENABLE_HIP=1)
   target_compile_options(gufo_inkling_hip PRIVATE
     $<$<COMPILE_LANGUAGE:HIP>:-O2>
+    $<$<COMPILE_LANGUAGE:HIP>:-fgpu-default-stream=per-thread>
     $<$<COMPILE_LANGUAGE:HIP>:-Wno-unused-command-line-argument>
   )
   target_include_directories(gufo_inkling_hip PUBLIC "$<BUILD_INTERFACE:${GUFO_EXTENSION_BUILD_ROOT}>")

@@ -12,9 +12,12 @@ namespace inkling::gpu {
 enum WType : int { W_F32 = 0, W_BF16 = 1, W_Q8_0 = 2, W_Q5_K = 3, W_NVFP4 = 4 };
 constexpr int kWave = 32;
 
+// Q8_0 and NVFP4 weights are repacked at upload into planar rows (all quantized values, then all block scales), padded to 16 bytes,
+// so that a lane can fetch 16 bytes at a time: Q8_0 row = K int8 + K/32 f16 scales; NVFP4 row = K/2 bytes of nibbles + K/16 ue4m3 scales.
+__host__ __device__ inline size_t align16(size_t n) { return (n + 15) & ~(size_t)15; }
 __host__ __device__ inline size_t row_bytes_of(int wt, int K) {
-  switch (wt) { case W_F32: return (size_t)K * 4; case W_BF16: return (size_t)K * 2; case W_Q8_0: return (size_t)(K / 32) * 34;
-    case W_Q5_K: return (size_t)(K / 256) * 176; case W_NVFP4: return (size_t)(K / 64) * 36; }
+  switch (wt) { case W_F32: return (size_t)K * 4; case W_BF16: return (size_t)K * 2; case W_Q8_0: return align16((size_t)K + (size_t)(K / 32) * 2);
+    case W_Q5_K: return (size_t)(K / 256) * 176; case W_NVFP4: return align16((size_t)K / 2 + (size_t)(K / 16)); }
   return 0;
 }
 
@@ -30,7 +33,7 @@ __constant__ int8_t kFp4D[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6,
 
 // Dequantize 32 consecutive elements (work item `it` of a row) into out[32].
 template <int WT>
-__device__ inline void dq32(const uint8_t* row, int it, float* out) {
+__device__ inline void dq32(const uint8_t* row, int it, float* out, int kq8_K) {
   if constexpr (WT == W_F32) {
     const float* p = (const float*)row + it * 32;
 #pragma unroll
@@ -40,19 +43,21 @@ __device__ inline void dq32(const uint8_t* row, int it, float* out) {
 #pragma unroll
     for (int i = 0; i < 32; ++i) out[i] = bf2f(p[i]);
   } else if constexpr (WT == W_Q8_0) {
-    const uint8_t* b = row + (size_t)it * 34;
-    float d = h2f(*(const uint16_t*)b);
-    const int8_t* q = (const int8_t*)(b + 2);
+    // planar: int8 values at row + it*32 (32-byte aligned), f16 scale at row + K + it*2; K is recovered from the caller through kq8_K
+    const uint8_t* q = row + (size_t)it * 32;
+    const uint4 v0 = *(const uint4*)q, v1 = *(const uint4*)(q + 16);
+    const float d = h2f(*(const uint16_t*)(row + kq8_K + (size_t)it * 2));
+    const int8_t* a = (const int8_t*)&v0; const int8_t* b = (const int8_t*)&v1;
 #pragma unroll
-    for (int i = 0; i < 32; ++i) out[i] = d * q[i];
+    for (int i = 0; i < 16; ++i) { out[i] = d * a[i]; out[16 + i] = d * b[i]; }
   } else if constexpr (WT == W_NVFP4) {
-    const uint8_t* b = row + (size_t)(it >> 1) * 36; const int half = it & 1;  // 64-element block = 2 items
-    const uint8_t* qs = b + 4;
+    // planar: nibbles at row + it*16 (16 bytes = 32 elements = 2 sub-blocks of 16), ue4m3 scales at row + K/2 + it*2
+    const uint4 v = *(const uint4*)(row + (size_t)it * 16); const uint8_t* qs = (const uint8_t*)&v; const uint8_t* sc = row + kq8_K / 2 + (size_t)it * 2;
 #pragma unroll
-    for (int s = 0; s < 2; ++s) {
-      const int sb = half * 2 + s; float d = ue4m3_to_f32(b[sb]);
+    for (int s2 = 0; s2 < 2; ++s2) {
+      const float d = ue4m3_to_f32(sc[s2]);
 #pragma unroll
-      for (int j = 0; j < 8; ++j) { uint8_t q = qs[sb * 8 + j]; out[s * 16 + j] = kFp4D[q & 0xF] * d; out[s * 16 + j + 8] = kFp4D[q >> 4] * d; }
+      for (int j = 0; j < 8; ++j) { const uint8_t q = qs[s2 * 8 + j]; out[s2 * 16 + j] = kFp4D[q & 0xF] * d; out[s2 * 16 + j + 8] = kFp4D[q >> 4] * d; }
     }
   } else if constexpr (WT == W_Q5_K) {
     const uint8_t* b = row + (size_t)(it >> 3) * 176; const int g = it & 7;  // 256-element block = 8 items
@@ -87,7 +92,7 @@ __global__ void k_gemm(const uint8_t* __restrict__ W, int K, int N, const float*
   for (int i = 0; i < NT; ++i) acc[i] = 0.f;
   const int nit = K / 32;
   for (int it = lane; it < nit; it += kWave) {
-    float w[32]; dq32<WT>(row, it, w);
+    float w[32]; dq32<WT>(row, it, w, K);
 #pragma unroll
     for (int i = 0; i < NT; ++i) {
       if (t0 + i < T) {
@@ -108,10 +113,10 @@ __global__ void k_gemm(const uint8_t* __restrict__ W, int K, int N, const float*
 // ---------------------------------------------------------------------------------------------------------------
 __global__ void k_embed_norm(const int* tokens, const uint8_t* emb, size_t row_bytes, const float* norm, float* X, int E, float eps) {
   extern __shared__ float sh[];  // E floats + 32
-  const int t = blockIdx.x; const uint8_t* row = emb + (size_t)tokens[t] * row_bytes;
+  const int t = blockIdx.x; const uint8_t* row = emb + (size_t)tokens[t] * row_bytes;   // planar Q8_0: E int8, then E/32 f16 scales
   float ss = 0.f;
   for (int i = threadIdx.x; i < E; i += blockDim.x) {
-    const uint8_t* b = row + (size_t)(i / 32) * 34; float v = h2f(*(const uint16_t*)b) * (float)((const int8_t*)(b + 2))[i % 32];
+    float v = h2f(*(const uint16_t*)(row + E + (size_t)(i / 32) * 2)) * (float)((const int8_t*)row)[i];
     sh[i] = v; ss += v * v;
   }
   float* red = sh + E; red[threadIdx.x] = ss; __syncthreads();
@@ -238,6 +243,7 @@ __global__ void k_attn_part(const float* q, const float* r, const float* sinks, 
   const int t = blockIdx.x / NH, h = blockIdx.x % NH, sp = blockIdx.y, tid = threadIdx.x;
   const int p = pos[t], kv = h / (NH / NKV); const int sq = seq[t];
   const int jlo = window ? max(0, p - window + 1) : 0;
+  if (chunk <= 0) chunk = max(2048, (p + 1 + nsplit - 1) / nsplit);
   const int j0 = jlo + sp * chunk, j1 = min(p + 1, j0 + chunk);
   const size_t o = ((size_t)blockIdx.x * nsplit + sp);
   if (j0 >= j1) { if (tid == 0) { pm[o] = -1e30f; pl[o] = 0.f; } pacc[o * 128 + tid] = 0.f; return; }
@@ -321,7 +327,7 @@ __global__ void k_moe_gate_up(const uint8_t* W, int K, int NF, const float* X /*
 #pragma unroll
   for (int i = 0; i < NT; ++i) { ag[i] = 0.f; au[i] = 0.f; }
   for (int it = lane; it < K / 32; it += kWave) {
-    float wg[32], wu[32]; dq32<WT>(Wg, it, wg); dq32<WT>(Wu, it, wu);
+    float wg[32], wu[32]; dq32<WT>(Wg, it, wg, K); dq32<WT>(Wu, it, wu, K);
 #pragma unroll
     for (int i = 0; i < NT; ++i) if (p0 + i < cnt) {
       const int tok = lists[(size_t)e * npairs + p0 + i] / 8; const float* x = X + (size_t)tok * K + it * 32; float sg = 0.f, su = 0.f;
@@ -351,7 +357,7 @@ __global__ void k_moe_down(const uint8_t* W, int K, int N, const float* hid, con
 #pragma unroll
   for (int i = 0; i < NT; ++i) acc[i] = 0.f;
   for (int it = lane; it < K / 32; it += kWave) {
-    float w[32]; dq32<WT>(row, it, w);
+    float w[32]; dq32<WT>(row, it, w, K);
 #pragma unroll
     for (int i = 0; i < NT; ++i) if (p0 + i < cnt) {
       const float* x = hid + (size_t)lists[(size_t)e * npairs + p0 + i] * K + it * 32; float s = 0.f;
