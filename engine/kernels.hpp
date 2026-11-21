@@ -110,6 +110,18 @@ __global__ void k_gemm(const uint8_t* __restrict__ W, int K, int N, const float*
   }
 }
 
+// Block reduction of N values (blockDim.x a multiple of the wave size, at most 256 threads): wave shuffles, then one LDS exchange. Result in sh_out[0..N).
+template <int N>
+__device__ inline void block_sum_n(float* v, float* sh_waves /*[8][N]*/, float* sh_out) {
+  const int wave = threadIdx.x / kWave, lane = threadIdx.x % kWave, nw = blockDim.x / kWave;
+#pragma unroll
+  for (int i = 0; i < N; ++i) v[i] = wave_sum(v[i]);
+  if (lane == 0) for (int i = 0; i < N; ++i) sh_waves[wave * N + i] = v[i];
+  __syncthreads();
+  if (threadIdx.x < N) { float t = 0.f; for (int w = 0; w < nw; ++w) t += sh_waves[w * N + threadIdx.x]; sh_out[threadIdx.x] = t; }
+  __syncthreads();
+}
+
 // ---------------------------------------------------------------------------------------------------------------
 __global__ void k_embed_norm(const int* tokens, const uint8_t* emb, size_t row_bytes, const float* norm, float* X, int E, float eps) {
   extern __shared__ float sh[];  // E floats + 32
@@ -127,34 +139,27 @@ __global__ void k_embed_norm(const int* tokens, const uint8_t* emb, size_t row_b
 
 // rows of length E: out = rms(in) * w (w optional)
 __global__ void k_rmsnorm(const float* in, const float* w, float* out, int E, float eps) {
-  __shared__ float red[256]; const int t = blockIdx.x; const float* x = in + (size_t)t * E; float ss = 0.f;
-  for (int i = threadIdx.x; i < E; i += blockDim.x) ss += x[i] * x[i];
-  red[threadIdx.x] = ss; __syncthreads();
-  for (int o = blockDim.x / 2; o > 0; o >>= 1) { if (threadIdx.x < o) red[threadIdx.x] += red[threadIdx.x + o]; __syncthreads(); }
-  const float r = 1.f / sqrtf(red[0] / E + eps);
+  __shared__ float shw[8], sho[1]; const int t = blockIdx.x; const float* x = in + (size_t)t * E; float v[1] = {0.f};
+  for (int i = threadIdx.x; i < E; i += blockDim.x) v[0] += x[i] * x[i];
+  block_sum_n<1>(v, shw, sho);
+  const float r = 1.f / sqrtf(sho[0] / E + eps);
   for (int i = threadIdx.x; i < E; i += blockDim.x) out[(size_t)t * E + i] = x[i] * r * (w ? w[i] : 1.f);
 }
 
 // attention over depth. states: nb block buffers + cur (all [T,E]); query [nq,E]; outs[q] -> [T,E].
 struct MixArgs { const float* st[6]; int ns; float* out[4]; int nq; };
 __global__ void k_mix(MixArgs a, const float* query, int E, float eps) {
-  __shared__ float red[24][256]; __shared__ float inv[6]; __shared__ float wt[4][6];
+  __shared__ float shw[8 * 30], sho[30]; __shared__ float inv[6]; __shared__ float wt[4][6];
   const int t = blockIdx.x, tid = threadIdx.x;
-  float ss[6], sc[24];
-  for (int s = 0; s < a.ns; ++s) ss[s] = 0.f;
-  for (int q = 0; q < 24; ++q) sc[q] = 0.f;
-  for (int i = tid; i < E; i += blockDim.x) for (int s = 0; s < a.ns; ++s) { float v = a.st[s][(size_t)t * E + i]; ss[s] += v * v; }
-  for (int s = 0; s < a.ns; ++s) red[s][tid] = ss[s];
-  __syncthreads();
-  for (int o = blockDim.x / 2; o > 0; o >>= 1) { if (tid < o) for (int s = 0; s < a.ns; ++s) red[s][tid] += red[s][tid + o]; __syncthreads(); }
-  if (tid < a.ns) inv[tid] = 1.f / sqrtf(red[tid][0] / E + eps);
-  __syncthreads();
-  for (int i = tid; i < E; i += blockDim.x) for (int s = 0; s < a.ns; ++s) { float v = a.st[s][(size_t)t * E + i] * inv[s]; for (int q = 0; q < a.nq; ++q) sc[s * 4 + q] += v * query[(size_t)q * E + i]; }
-  for (int k = 0; k < a.ns * 4; ++k) red[k][tid] = sc[k];
-  __syncthreads();
-  for (int o = blockDim.x / 2; o > 0; o >>= 1) { if (tid < o) for (int k = 0; k < a.ns * 4; ++k) red[k][tid] += red[k][tid + o]; __syncthreads(); }
+  float ss[6] = {0, 0, 0, 0, 0, 0};
+  for (int i = tid; i < E; i += blockDim.x) for (int s = 0; s < a.ns; ++s) { const float v = a.st[s][(size_t)t * E + i]; ss[s] += v * v; }
+  block_sum_n<6>(ss, shw, sho);
+  for (int s = 0; s < a.ns; ++s) inv[s] = 1.f / sqrtf(sho[s] / E + eps);
+  float sc[24]; for (int q = 0; q < 24; ++q) sc[q] = 0.f;
+  for (int i = tid; i < E; i += blockDim.x) for (int s = 0; s < a.ns; ++s) { const float v = a.st[s][(size_t)t * E + i] * inv[s]; for (int q = 0; q < a.nq; ++q) sc[s * 4 + q] += v * query[(size_t)q * E + i]; }
+  block_sum_n<24>(sc, shw, sho);
   if (tid < a.nq) {
-    float mx = -1e30f; for (int s = 0; s < a.ns; ++s) { float v = red[s * 4 + tid][0] * rsqrtf((float)E); wt[tid][s] = v; mx = fmaxf(mx, v); }
+    float mx = -1e30f; for (int s = 0; s < a.ns; ++s) { const float v = sho[s * 4 + tid] * rsqrtf((float)E); wt[tid][s] = v; mx = fmaxf(mx, v); }
     float sum = 0.f; for (int s = 0; s < a.ns; ++s) { wt[tid][s] = expf(wt[tid][s] - mx); sum += wt[tid][s]; }
     for (int s = 0; s < a.ns; ++s) wt[tid][s] /= sum;
   }
@@ -165,11 +170,10 @@ __global__ void k_mix(MixArgs a, const float* query, int E, float eps) {
 
 // gate[t] = [rms(cur[t]), rms(msg[t])]
 __global__ void k_control_gate(const float* cur, const float* msg, float* gate, int E, float eps) {
-  __shared__ float red[2][256]; const int t = blockIdx.x, tid = threadIdx.x; float a = 0.f, b = 0.f;
-  for (int i = tid; i < E; i += blockDim.x) { float x = cur[(size_t)t * E + i], y = msg[(size_t)t * E + i]; a += x * x; b += y * y; }
-  red[0][tid] = a; red[1][tid] = b; __syncthreads();
-  for (int o = blockDim.x / 2; o > 0; o >>= 1) { if (tid < o) { red[0][tid] += red[0][tid + o]; red[1][tid] += red[1][tid + o]; } __syncthreads(); }
-  const float ra = 1.f / sqrtf(red[0][0] / E + eps), rb = 1.f / sqrtf(red[1][0] / E + eps);
+  __shared__ float shw[8 * 2], sho[2]; const int t = blockIdx.x, tid = threadIdx.x; float v[2] = {0.f, 0.f};
+  for (int i = tid; i < E; i += blockDim.x) { const float x = cur[(size_t)t * E + i], y = msg[(size_t)t * E + i]; v[0] += x * x; v[1] += y * y; }
+  block_sum_n<2>(v, shw, sho);
+  const float ra = 1.f / sqrtf(sho[0] / E + eps), rb = 1.f / sqrtf(sho[1] / E + eps);
   for (int i = tid; i < E; i += blockDim.x) { gate[(size_t)t * 2 * E + i] = cur[(size_t)t * E + i] * ra; gate[(size_t)t * 2 * E + E + i] = msg[(size_t)t * E + i] * rb; }
 }
 __global__ void k_control_apply(const float* cur, const float* msg, const float* gain, const float* forget, float* out, int n) {
