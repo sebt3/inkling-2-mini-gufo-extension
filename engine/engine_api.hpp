@@ -33,7 +33,20 @@ class GpuEngine {
 
   // Feed `n` consecutive tokens of one sequence (positions pos0..pos0+n-1), in chunks; returns the logits of the last.
   // embd_mask/embd (optional): for tokens with embd_mask[i] != 0 the row embd[i*n_embd ..) replaces the token embedding (images).
-  bool Append(int seq, const int* tokens, int n, int pos0, std::vector<float>* logits, std::string* error, const int* embd_mask = nullptr, const float* embd = nullptr);
+  bool Append(int seq, const int* tokens, int n, int pos0, std::vector<float>* logits, std::string* error, const int* embd_mask = nullptr, const float* embd = nullptr, bool capture_features = false);
+  // Verification batch of one sequence: logits of every row, tap features kept for the drafter, convolution state saved for RollbackConv.
+  bool AppendRows(int seq, const int* tokens, int n, int pos0, std::vector<std::vector<float>>* logits, bool capture_features, bool save_conv, std::string* error);
+  void RollbackConv(int seq, int keep);
+  const float* features_dev() const;  // device pointer to [rows][4*n_embd] of the last captured batch
+  // DSpark drafter (speculative decoding). Sequences of the drafter are independent of the engine's.
+  bool LoadDSpark(const std::string& path, std::string* error);
+  bool has_dspark() const;
+  int DSparkCreateSeq();
+  void DSparkDestroySeq(int dseq);
+  void DSparkReset(int dseq, long pos);                                  // no context before `pos`
+  long DSparkContextFrom(int dseq) const;
+  void DSparkInject(int dseq, long pos0, int n);                         // features of the last captured batch, rows [0, n) at pos0..
+  std::vector<int> DSparkDraft(int dseq, int anchor, long pos0, int k);  // up to k proposed tokens after `anchor`
   // vision: load the projector (mmproj) once, then encode planar normalised [3][H][W] images (W and H multiples of 40)
   bool LoadVision(const std::string& mmproj_path, std::string* error);
   bool has_vision() const;

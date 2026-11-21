@@ -32,5 +32,10 @@ cd $SRC && mkdir -p $BUILD && clang++ $HIPFLAGS -O2 -std=c++20 -Wno-unused-resul
 ls -la $BUILD/inkling_vision
 X
   ;;
-  *) echo "usage: $0 sync|run|build-ref|build-oracle-dump|build-gpu|build-vision"; exit 2 ;;
+  build-spec) "$0" run <<'X'
+cd $SRC && mkdir -p $BUILD && clang++ $HIPFLAGS -O2 -std=c++20 -Wno-unused-result -Wno-deprecated-declarations tools/inkling_spec.cpp engine/engine_api.hip.cpp -o $BUILD/inkling_spec 2>&1 | grep -E "error" -A5 | head -40
+ls -la $BUILD/inkling_spec
+X
+  ;;
+  *) echo "usage: $0 sync|run|build-ref|build-oracle-dump|build-gpu|build-vision|build-spec"; exit 2 ;;
 esac

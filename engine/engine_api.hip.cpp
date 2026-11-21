@@ -3,7 +3,7 @@
 
 namespace inkling {
 
-struct GpuEngine::Impl { std::unique_ptr<gpu::Engine> e; };
+struct GpuEngine::Impl { std::unique_ptr<gpu::Engine> e; std::unique_ptr<gpu::DSpark> ds; };
 
 std::unique_ptr<GpuEngine> GpuEngine::Load(const std::string& path, int max_ctx, std::string* error) {
   try {
@@ -22,12 +22,13 @@ int GpuEngine::CreateSeq(std::string* error) { try { return impl_->e->create_seq
 void GpuEngine::DestroySeq(int seq) { impl_->e->destroy_seq(seq); }
 void GpuEngine::ResetSeq(int seq) { impl_->e->reset_sequence(seq); }
 
-bool GpuEngine::Append(int seq, const int* tokens, int n, int pos0, std::vector<float>* logits, std::string* error, const int* embd_mask, const float* embd) {
+bool GpuEngine::Append(int seq, const int* tokens, int n, int pos0, std::vector<float>* logits, std::string* error, const int* embd_mask, const float* embd, bool capture_features) {
   try {
     for (int o = 0; o < n; o += gpu::Engine::MAX_T) {
       const int m = std::min(gpu::Engine::MAX_T, n - o); gpu::Batch b;
       for (int i = 0; i < m; ++i) { b.tokens.push_back(tokens[o + i]); b.seq.push_back(seq); b.pos.push_back(pos0 + o + i); }
       if (o + m == n) b.want_logits.push_back(m - 1);
+      b.capture_features = capture_features;
       if (embd_mask) { bool any = false; for (int i = 0; i < m; ++i) any = any || embd_mask[o + i];
         if (any) { b.embd_mask.assign(embd_mask + o, embd_mask + o + m); b.embd.assign(embd + (size_t)o * info_.n_embd, embd + (size_t)(o + m) * info_.n_embd); } }
       auto r = impl_->e->step(b); if (o + m == n && logits) *logits = std::move(r);
@@ -49,6 +50,26 @@ int GpuEngine::vision_dim() const { return impl_->e->vision_dim(); }
 bool GpuEngine::EncodeImage(const std::vector<float>& planar, int W, int H, std::vector<float>* rows, int* n, std::string* error) {
   try { *rows = impl_->e->encode_image(planar, W, H, n); return true; } catch (const std::exception& ex) { if (error) *error = ex.what(); return false; }
 }
+bool GpuEngine::AppendRows(int seq, const int* tokens, int n, int pos0, std::vector<std::vector<float>>* logits, bool capture_features, bool save_conv, std::string* error) {
+  try {
+    if (n > gpu::Engine::MAX_T || n > 32) throw std::runtime_error("verification batch too large");
+    gpu::Batch b; for (int i = 0; i < n; ++i) { b.tokens.push_back(tokens[i]); b.seq.push_back(seq); b.pos.push_back(pos0 + i); b.want_logits.push_back(i); }
+    b.capture_features = capture_features; b.save_conv = save_conv;
+    auto r = impl_->e->step(b); const int V = info_.n_vocab; logits->assign(n, {});
+    for (int i = 0; i < n; ++i) (*logits)[i].assign(r.begin() + (size_t)i * V, r.begin() + (size_t)(i + 1) * V);
+    return true;
+  } catch (const std::exception& ex) { if (error) *error = ex.what(); return false; }
+}
+void GpuEngine::RollbackConv(int seq, int keep) { impl_->e->rollback_conv(seq, keep); }
+const float* GpuEngine::features_dev() const { return impl_->e->features_dev(); }
+bool GpuEngine::LoadDSpark(const std::string& path, std::string* error) { try { impl_->ds = std::make_unique<gpu::DSpark>(*impl_->e, path); return true; } catch (const std::exception& ex) { if (error) *error = ex.what(); return false; } }
+bool GpuEngine::has_dspark() const { return (bool)impl_->ds; }
+int GpuEngine::DSparkCreateSeq() { return impl_->ds->create_seq(); }
+void GpuEngine::DSparkDestroySeq(int d) { impl_->ds->destroy_seq(d); }
+void GpuEngine::DSparkReset(int d, long pos) { impl_->ds->reset(d, pos); }
+long GpuEngine::DSparkContextFrom(int d) const { return impl_->ds->ctx_from(d); }
+void GpuEngine::DSparkInject(int d, long pos0, int n) { impl_->ds->inject(d, pos0, n); }
+std::vector<int> GpuEngine::DSparkDraft(int d, int anchor, long pos0, int k) { return impl_->ds->draft(d, anchor, pos0, k); }
 void GpuEngine::TransferRows(int seq, int slot, bool is_v, long first, long end, uint8_t* host, bool to_host) { impl_->e->transfer_rows(seq, slot, is_v, first, end, host, to_host); }
 void GpuEngine::ExportPrivate(int seq, uint8_t* out) { impl_->e->export_private(seq, out); }
 void GpuEngine::ImportPrivate(int seq, const uint8_t* in) { impl_->e->import_private(seq, in); }

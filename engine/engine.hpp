@@ -15,6 +15,7 @@
 
 namespace inkling::gpu {
 
+class DSpark;
 struct DTensor { void* d = nullptr; int wt = W_F32; int K = 0, N = 0, NE = 1; };
 
 struct Config {
@@ -34,9 +35,12 @@ struct Batch {
   std::vector<int> want_logits;  // indices (into the batch) of tokens whose logits are returned
   std::vector<int> embd_mask;    // optional, size T: 1 where embd row t replaces the token embedding (images)
   std::vector<float> embd;       // optional, T x n_embd
+  bool capture_features = false; // keep the residual stream at the DSpark tap points (see feature_*)
+  bool save_conv = false;        // keep what is needed to roll the convolution state back (verification batches, one sequence, T <= 16)
 };
 
 class Engine {
+  friend class DSpark;
  public:
   static constexpr int MAXSEQ = 16, LOCAL_CAP = 2048, MAX_T = 1024;
   Config c;
@@ -102,6 +106,19 @@ class Engine {
   }
   size_t weight_bytes() const { return weight_bytes_; }
   int max_ctx() const { return max_ctx_; }
+  const float* features_dev() const { return d_feat_; }
+  // after a verification batch (Batch::save_conv): restore the convolution histories as they were after the first `keep` batch tokens
+  void rollback_conv(int seq, int keep) {
+    if (keep < 1 || keep > save_T_) throw std::runtime_error("engine: bad rollback length");
+    const int NS = c.n_slot(); std::vector<const float*> op, vp; std::vector<float*> hp; std::vector<int> ch;
+    for (int slot = 0; slot < NS; ++slot) for (int k = 0; k < 4; ++k) { op.push_back(osave_[slot * 4 + k]); vp.push_back(vsave_[slot * 4 + k]); hp.push_back(hist_host_[slot * 4 + k][seq]); ch.push_back(hist_ch(k)); }
+    const float **dop, **dvp; float** dhp; int* dch; const int n = NS * 4;
+    HIP_CHECK(hipMalloc(&dop, n * 8)); HIP_CHECK(hipMalloc(&dvp, n * 8)); HIP_CHECK(hipMalloc(&dhp, n * 8)); HIP_CHECK(hipMalloc(&dch, n * 4));
+    HIP_CHECK(hipMemcpy(dop, op.data(), n * 8, hipMemcpyHostToDevice)); HIP_CHECK(hipMemcpy(dvp, vp.data(), n * 8, hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(dhp, hp.data(), n * 8, hipMemcpyHostToDevice)); HIP_CHECK(hipMemcpy(dch, ch.data(), n * 4, hipMemcpyHostToDevice));
+    k_conv_rollback<<<dim3((2304 + 127) / 128, n), 128>>>(dop, dvp, dch, keep, dhp);
+    HIP_CHECK(hipDeviceSynchronize()); hipFree(dop); hipFree(dvp); hipFree(dhp); hipFree(dch);
+  }
   void load_vision(const std::string& path) { vision_ = std::make_unique<Vision>(path); }
   bool has_vision() const { return (bool)vision_; }
   int vision_dim() const { return vision_ ? vision_->out_dim() : 0; }
@@ -140,6 +157,8 @@ class Engine {
   // scratch (max batch)
   float *xn_[3], *q_, *k0_, *v0_, *r_, *sinks_, *gate_, *kd_, *vd_, *K_, *V_, *att_, *o_, *tmp_e_, *tmp_e2_, *logits_gate_, *moe_, *wts_, *hid_, *dn_, *ctrl_gate_, *ctrl_low_, *ctrl_a_, *ctrl_b_;
   float* d_embd_ = nullptr; int* d_emask_ = nullptr;
+  float* d_feat_ = nullptr;                                   // [MAX_T][4*E] tap features of the last captured batch
+  std::vector<float*> vsave_, osave_; bool save_conv_ = false; int save_seq_ = 0, save_T_ = 0;  // rollback data, per (slot, kind)
   float *pm_, *pl_, *pacc_; int *forced_ = nullptr; int *ids_, *lists_, *counts_;
   int *d_tok_, *d_seq_, *d_pos_, *d_first_, *d_count_, *d_rows_; float* d_logit_in_; float* d_logits_;
   std::vector<float*> pool_; std::vector<int> pool_rc_;
@@ -211,7 +230,7 @@ class Engine {
     const int NSPLIT = 16; pm_ = dmalloc((size_t)T * c.n_head * NSPLIT); pl_ = dmalloc((size_t)T * c.n_head * NSPLIT); pacc_ = dmalloc((size_t)T * c.n_head * NSPLIT * 128);
     HIP_CHECK(hipMalloc(&ids_, (size_t)T * 8 * 4)); HIP_CHECK(hipMalloc(&forced_, (size_t)T * 8 * 4)); HIP_CHECK(hipMalloc(&lists_, (size_t)c.n_expert * T * 8 * 4)); HIP_CHECK(hipMalloc(&counts_, c.n_expert * 4));
     HIP_CHECK(hipMalloc(&d_tok_, T * 4)); HIP_CHECK(hipMalloc(&d_seq_, T * 4)); HIP_CHECK(hipMalloc(&d_pos_, T * 4)); HIP_CHECK(hipMalloc(&d_first_, MAXSEQ * 4)); HIP_CHECK(hipMalloc(&d_count_, MAXSEQ * 4));
-    HIP_CHECK(hipMalloc(&d_rows_, T * 4)); d_embd_ = dmalloc((size_t)T * E); HIP_CHECK(hipMalloc(&d_emask_, T * 4)); d_logit_in_ = dmalloc((size_t)T * E); d_logits_ = dmalloc((size_t)MAXSEQ * 4 * c.n_vocab_unpadded);
+    HIP_CHECK(hipMalloc(&d_rows_, T * 4)); d_feat_ = dmalloc((size_t)T * 4 * E); d_embd_ = dmalloc((size_t)T * E); HIP_CHECK(hipMalloc(&d_emask_, T * 4)); d_logit_in_ = dmalloc((size_t)T * E); d_logits_ = dmalloc((size_t)MAXSEQ * 4 * c.n_vocab_unpadded);
   }
   void alloc_tables() {
     const int NS = c.n_slot(); kc_host_.assign(NS, std::vector<__half*>(MAXSEQ, nullptr)); vc_host_.assign(NS, std::vector<__half*>(MAXSEQ, nullptr)); hist_host_.assign(NS * 4, std::vector<float*>(MAXSEQ, nullptr));
@@ -219,6 +238,7 @@ class Engine {
       __half** dk; __half** dv; HIP_CHECK(hipMalloc(&dk, MAXSEQ * 8)); HIP_CHECK(hipMalloc(&dv, MAXSEQ * 8)); kc_tab_.push_back(dk); vc_tab_.push_back(dv);
       for (int kind = 0; kind < 4; ++kind) { float** dh; HIP_CHECK(hipMalloc(&dh, MAXSEQ * 8)); hist_tab_.push_back(dh); }
     }
+    for (int slot = 0; slot < NS; ++slot) for (int kind = 0; kind < 4; ++kind) { vsave_.push_back(dmalloc((size_t)16 * hist_ch(kind))); osave_.push_back(dmalloc((size_t)3 * hist_ch(kind))); }
     sync_tables();
   }
   void sync_tables() {
@@ -260,6 +280,10 @@ class Engine {
   void conv(const float* x, const float* w, const float* dyn, int slot, int kind, float* out, int ch) {
     dim3 g((ch + 127) / 128, T_);
     k_conv<<<g, 128>>>(x, w, dyn, dyn ? c.n_head_kv : 0, d_seq_, d_pos_, d_first_, hist_tab_[slot * 4 + kind], out, T_, ch);
+    if (save_conv_) {  // single-sequence verification batch: keep the old history and the inputs
+      HIP_CHECK(hipMemcpy(osave_[slot * 4 + kind], hist_host_[slot * 4 + kind][save_seq_], (size_t)3 * ch * 4, hipMemcpyDeviceToDevice));
+      HIP_CHECK(hipMemcpy(vsave_[slot * 4 + kind], x, (size_t)T_ * ch * 4, hipMemcpyDeviceToDevice));
+    }
     dim3 g2((ch + 127) / 128, MAXSEQ); k_conv_state<<<g2, 128>>>(x, d_first_, d_count_, hist_tab_[slot * 4 + kind], ch);
   }
   void dmp(const char* name, int slot, const float* p, int width) { if (dump) { HIP_CHECK(hipDeviceSynchronize()); dump(name, slot, p, T_, width); } }
@@ -339,6 +363,10 @@ inline float* Engine::layer(int slot, int ip, float* cur, std::vector<float*>& b
 inline std::vector<float> Engine::step(const Batch& b) {
   const int T = (int)b.tokens.size(), E = c.n_embd; if (T > MAX_T) throw std::runtime_error("batch too large");
   std::lock_guard<std::mutex> lk(mu);
+  save_conv_ = b.save_conv; save_seq_ = b.seq.empty() ? 0 : b.seq[0]; save_T_ = T;
+  if (save_conv_ && T > 16) throw std::runtime_error("engine: verification batches have at most 16 tokens");
+  const bool capf = b.capture_features; int app = 0;
+  auto tap = [&](float* x) { if (capf && (app == 5 || app == 23 || app == 41)) k_copy_cols<<<T_, 256>>>(x, d_feat_, c.n_embd, 4, app == 5 ? 0 : app == 23 ? 1 : 2); ++app; };
   T_ = T; pos_h_ = b.pos; maxpos_ = 0; step_cap_ = max_ctx_; for (int p : b.pos) maxpos_ = std::max(maxpos_, p);
   std::vector<int> first(MAXSEQ, 0), count(MAXSEQ, 0);
   for (int t = 0; t < T; ++t) { const int s = b.seq[t]; if (count[s] == 0) first[s] = t; count[s]++; }
@@ -354,7 +382,7 @@ inline std::vector<float> Engine::step(const Batch& b) {
   dmp("inp_embd", -1, cur, E);
   std::vector<float*> blocks;
   auto adv = [&](float* nw) { pdec(cur); cur = nw; };
-  for (int il = 0; il < c.loop_start; ++il) adv(layer(il, il, cur, blocks, nullptr, nullptr));
+  for (int il = 0; il < c.loop_start; ++il) { tap(cur); adv(layer(il, il, cur, blocks, nullptr, nullptr)); }
   float* prelude = cur; pinc(prelude); std::vector<float*> prelude_blocks = blocks; for (float* p : prelude_blocks) pinc(p);
   const int core = c.loop_end - c.loop_start;
   for (int pass = 0; pass < c.n_passes; ++pass) {
@@ -368,14 +396,16 @@ inline std::vector<float> Engine::step(const Batch& b) {
     }
     for (int ip = c.loop_start; ip < c.loop_end; ++ip) {
       const int slot = pass == 0 ? ip : c.n_layer + (pass - 1) * core + (ip - c.loop_start);
+      tap(cur);
       if (pass == 0) { adv(layer(slot, ip, cur, blocks, nullptr, nullptr)); continue; }
       std::vector<float*> msgs; mix(bank, bank_out, layers_[ip].msg_query, 4, msgs);
       float* nw = layer(slot, ip, cur, blocks, &msgs, &layers_[ip]); for (float* m : msgs) pdec(m); adv(nw);
     }
     if (pass > 0) { for (float* p : bank) pdec(p); pdec(bank_out); }
   }
-  for (int il = c.loop_end; il < c.n_layer; ++il) adv(layer(il, il, cur, blocks, nullptr, nullptr));
+  for (int il = c.loop_end; il < c.n_layer; ++il) { tap(cur); adv(layer(il, il, cur, blocks, nullptr, nullptr)); }
   std::vector<float*> om; mix(blocks, cur, out_res_, 1, om); rms(om[0], out_norm_, tmp_e_, T); pdec(om[0]);
+  if (capf) k_copy_cols<<<T_, 256>>>(tmp_e_, d_feat_, E, 4, 3);
   dmp("result_norm", -1, tmp_e_, E);
   // logits for the requested rows
   const int nl = (int)b.want_logits.size(); std::vector<float> res((size_t)nl * c.n_vocab_unpadded);
@@ -392,3 +422,5 @@ inline std::vector<float> Engine::step(const Batch& b) {
 }
 
 }  // namespace inkling::gpu
+
+#include "dspark.hpp"

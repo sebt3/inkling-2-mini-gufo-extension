@@ -371,6 +371,15 @@ __global__ void k_sigmoid_mul(float* att, const float* gate, int n) { const int 
 __global__ void k_softcap(float* x, int n, float cap) { const int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) x[i] = cap * tanhf(x[i] / cap); }
 // rows given as input embeddings (images) replace the token embedding, without the embedding norm
 __global__ void k_embd_override(float* X, const float* embd, const int* mask, int E) { const int t = blockIdx.x; if (!mask[t]) return; for (int i = threadIdx.x; i < E; i += blockDim.x) X[(size_t)t * E + i] = embd[(size_t)t * E + i]; }
+// copy a [T,E] block into column group `col` (of `groups`) of a [T, groups*E] feature buffer
+__global__ void k_copy_cols(const float* src, float* dst, int E, int groups, int col) { const int t = blockIdx.x; for (int i = threadIdx.x; i < E; i += blockDim.x) dst[(size_t)t * groups * E + (size_t)col * E + i] = src[(size_t)t * E + i]; }
+// history after token index keep-1 of a verification batch: last 3 of [old history, saved inputs 0..keep-1]
+__global__ void k_conv_rollback(const float* const* old, const float* const* saved, const int* chans, int keep, float* const* hist) {
+  const int sk = blockIdx.y, ch = chans[sk], c = blockIdx.x * blockDim.x + threadIdx.x; if (c >= ch) return;
+  float nw[3];
+  for (int l = 0; l < 3; ++l) { const int idx = 3 + keep - 1 - l; nw[2 - l] = idx >= 3 ? saved[sk][(size_t)(idx - 3) * ch + c] : old[sk][(size_t)idx * ch + c]; }
+  for (int i = 0; i < 3; ++i) hist[sk][(size_t)i * ch + c] = nw[i];
+}
 __global__ void k_gather_rows(const float* in, const int* rows, float* out, int E) { const int i = blockIdx.x; for (int c = threadIdx.x; c < E; c += blockDim.x) out[(size_t)i * E + c] = in[(size_t)rows[i] * E + c]; }
 
 }  // namespace inkling::gpu
