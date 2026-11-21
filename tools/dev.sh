@@ -18,9 +18,14 @@ ls -la $BUILD/inkling_ref
 X
   ;;
   build-oracle-dump) "$0" run <<'X'
-cd $SRC && mkdir -p $BUILD && g++ -O2 -std=c++17 -o $BUILD/oracle_dump tools/oracle_dump.cpp -I/src/llama.cpp/include -I/src/llama.cpp/ggml/include -L/tmp/llbuild/bin -lllama -lggml -lggml-base -Wl,-rpath,/tmp/llbuild/bin 2>&1 | head -20
+cd $SRC && mkdir -p $BUILD && g++ -O2 -std=c++17 -o $BUILD/oracle_dump tools/oracle_dump.cpp -I/src/llama.cpp/include -I/src/llama.cpp/ggml/include -L/src/llbuild/bin -lllama -lggml -lggml-base -Wl,-rpath,/src/llbuild/bin 2>&1 | head -20
 ls -la $BUILD/oracle_dump
 X
   ;;
-  *) echo "usage: $0 sync|run|build-ref|build-oracle-dump"; exit 2 ;;
+  build-gpu) "$0" run <<'X'
+cd $SRC && mkdir -p $BUILD && time clang++ $HIPFLAGS -O2 -std=c++20 -Wno-unused-result -Wno-deprecated-declarations tools/inkling_gpu.cpp -o $BUILD/inkling_gpu 2>&1 | grep -E "error|Error" -A5 | head -60
+ls -la $BUILD/inkling_gpu
+X
+  ;;
+  *) echo "usage: $0 sync|run|build-ref|build-oracle-dump|build-gpu"; exit 2 ;;
 esac

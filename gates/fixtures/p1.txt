@@ -1,0 +1,1 @@
+Un Deployment Kubernetes décrit l'état désiré d'une application : il crée des ReplicaSets
