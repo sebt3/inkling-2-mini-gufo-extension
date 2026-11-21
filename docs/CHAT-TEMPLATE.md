@@ -2,7 +2,8 @@
 
 Source: `tokenizer.chat_template` of `Inkling-2-Mini-UD-Q4_K_M.gguf` (6867 characters, Jinja, no `add_generation_prompt`
 branch). Reference rendering: llama.cpp b12617 (`44c20b1c0`), `/apply-template` of the oracle server. Implementation:
-`host/chat_template.cpp`, gate `gates/template_gate.py` (G2, 113/113 identical).
+`host/chat_template.cpp`, gate `gates/template_gate.py` (G2, 113/113 identical). Tools: see `docs/TOOLS.md`
+(gate G9a, `gates/tools_gate.py`).
 
 ## Variables the template reads
 
@@ -10,7 +11,7 @@ branch). Reference rendering: llama.cpp b12617 (`44c20b1c0`), `/apply-template` 
 |----------|-----|
 | `messages` | the conversation: `role`, `content` (string, list of parts, or null), `reasoning_content`, `name`, `tool_calls`, `tool_call_id` |
 | `reasoning_effort` | level name (`effort_map` key) or number; absent or null gives `0.9` |
-| `tools` | tool declarations (not implemented in `render_prompt`, see limits) |
+| `tools` | tool declarations: `Options::tools`, rendered in the `tool_declare` block (M9) |
 | `bos_token`, `eos_token`, `enable_thinking`, `add_generation_prompt` | not read by the template |
 
 ## Tokens
@@ -37,9 +38,12 @@ Role tokens: `user` `<|message_user|>`, `assistant` `<|message_model|>`, `system
 3. Text content (a null, absent or empty-array content is an empty string) is rendered as one block, unless the
    message is an assistant with reasoning and the text is empty.
 4. List content: one block per part, each block with the same header. Only `text` parts are accepted.
-5. Header of a tool message is `<|message_tool|>` + `name`, and of a named assistant message `<|message_model|>` + `name`.
-   The lookup of `tool_call_id` in earlier `tool_calls` is not implemented (no tool calls yet).
-6. Assistant messages end with the sampling marker.
+5. Header of a tool message is `<|message_tool|>` + `name`, or, without `name`, the name of every earlier tool call with
+   the same `tool_call_id`. A named assistant message is `<|message_model|>` + `name`; its name must equal the name of
+   each of its tool calls.
+6. Assistant `tool_calls` are rendered after the content blocks: `<|message_model|>NAME<|content_invoke_tool_json|>` +
+   `{"name":"NAME","args":{...}}` + `<|end_message|>`, arguments sorted at top level. See `docs/TOOLS.md`.
+7. Assistant messages end with the sampling marker.
 
 ## Server behaviour around the template (llama.cpp tools/server)
 
@@ -60,7 +64,9 @@ Role tokens: `user` `<|message_user|>`, `assistant` `<|message_model|>`, `system
 
 ## Limits of this milestone
 
-* Tools (`tools`, `tool_calls`, `tool_call_id` lookup, `<|content_invoke_tool_json|>` blocks): not rendered.
+* An assistant message with `tool_calls: []` and no `content` key is rejected here; the server accepts it. The
+  message type cannot tell an empty list from a missing key (the gate corpus does not contain this case).
 * Images (`<|content_image|>` with `<|unused_200054|>`): rejected with an error, the multimodal path is M6.
 * Audio is rejected by the template; the renderer rejects every non-text part.
 * `prefill_assistant = false` is not compared with the oracle (the server always prefills).
+* A trailing assistant message with tool calls is rejected when prefilled (server error, same text as the oracle).
