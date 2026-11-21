@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
+#include <chrono>
 #include <map>
 #include <mutex>
 #include <memory>
@@ -43,7 +44,7 @@ class Engine {
 
   // max_ctx: default context of sequences created with create_seq(0). Weights are uploaded here.
   Engine(const std::string& path, int max_ctx) : g_(path), max_ctx_(max_ctx) { load_config(); upload(); alloc_scratch(); alloc_tables(); }
-  ~Engine() = default;
+  ~Engine() { if (prof_) print_profile(); }
 
   // ---- sequences: independent KV caches and convolution histories, created on demand
   int create_seq(int max_ctx = 0) {
@@ -99,6 +100,14 @@ class Engine {
   size_t weight_bytes() const { return weight_bytes_; }
   int max_ctx() const { return max_ctx_; }
   std::mutex mu;  // serialises step(): one device stream
+  // INKLING_PROFILE=1: accumulated wall time per kernel group (synchronises after every group; for relative breakdowns only)
+  bool prof_ = std::getenv("INKLING_PROFILE") != nullptr; std::map<std::string, std::pair<double, long>> prof_ms_;
+  template <class F> void timed(const char* name, F f) {
+    if (!prof_) { f(); return; }
+    HIP_CHECK(hipDeviceSynchronize()); auto t0 = std::chrono::steady_clock::now(); f(); HIP_CHECK(hipDeviceSynchronize());
+    auto& e = prof_ms_[name]; e.first += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(); e.second++;
+  }
+  void print_profile() { double tot = 0; for (auto& [k, v] : prof_ms_) tot += v.first; for (auto& [k, v] : prof_ms_) fprintf(stderr, "[profile] %-14s %9.2f ms %6.1f%% (%ld calls, %.3f ms each)\n", k.c_str(), v.first, 100 * v.first / tot, v.second, v.first / v.second); }
 
   // run one batch; returns logits (n_vocab_unpadded each) for batch.want_logits
   std::vector<float> step(const Batch& b);
@@ -227,16 +236,18 @@ class Engine {
     switch (W.wt) { case W_F32: gemm_t<W_F32>(W, X, Y, T, N); break; case W_BF16: gemm_t<W_BF16>(W, X, Y, T, N); break; case W_Q8_0: gemm_t<W_Q8_0>(W, X, Y, T, N); break;
       case W_Q5_K: gemm_t<W_Q5_K>(W, X, Y, T, N); break; case W_NVFP4: gemm_t<W_NVFP4>(W, X, Y, T, N); break; }
   }
-  void rms(const float* in, const float* w, float* out, int T) { k_rmsnorm<<<T, 256>>>(in, w, out, c.n_embd, c.eps); }
+  void rms(const float* in, const float* w, float* out, int T) { timed("rmsnorm", [&] { k_rmsnorm<<<T, 256>>>(in, w, out, c.n_embd, c.eps); }); }
   void mix(const std::vector<float*>& blocks, float* cur, const float* query, int nq, std::vector<float*>& outs) {
     MixArgs a{}; a.ns = (int)blocks.size() + 1; for (size_t i = 0; i < blocks.size(); ++i) a.st[i] = blocks[i]; a.st[blocks.size()] = cur; a.nq = nq;
     outs.clear(); for (int q = 0; q < nq; ++q) { outs.push_back(pget()); a.out[q] = outs.back(); }
-    k_mix<<<T_, 256>>>(a, query, c.n_embd, c.eps);
+    timed("mix", [&] { k_mix<<<T_, 256>>>(a, query, c.n_embd, c.eps); });
   }
   float* control(float* cur, float* msg, const L& Ly, int ctrl) {
-    const int E = c.n_embd, R = c.gate_rank; k_control_gate<<<T_, 256>>>(cur, msg, ctrl_gate_, E, c.eps);
-    gemm(Ly.c_down[ctrl], ctrl_gate_, ctrl_low_, T_); gemm(Ly.c_gain[ctrl], ctrl_low_, ctrl_a_, T_); gemm(Ly.c_forget[ctrl], ctrl_low_, ctrl_b_, T_);
-    float* out = pget(); const int n = T_ * E; k_control_apply<<<(n + 255) / 256, 256>>>(cur, msg, ctrl_a_, ctrl_b_, out, n); (void)R; return out;
+    const int E = c.n_embd, R = c.gate_rank; float* out = pget(); const int n = T_ * E;
+    timed("control", [&] { k_control_gate<<<T_, 256>>>(cur, msg, ctrl_gate_, E, c.eps);
+      gemm(Ly.c_down[ctrl], ctrl_gate_, ctrl_low_, T_); gemm(Ly.c_gain[ctrl], ctrl_low_, ctrl_a_, T_); gemm(Ly.c_forget[ctrl], ctrl_low_, ctrl_b_, T_);
+      k_control_apply<<<(n + 255) / 256, 256>>>(cur, msg, ctrl_a_, ctrl_b_, out, n); });
+    (void)R; return out;
   }
   void conv(const float* x, const float* w, const float* dyn, int slot, int kind, float* out, int ch) {
     dim3 g((ch + 127) / 128, T_);
@@ -262,23 +273,25 @@ inline float* Engine::layer(int slot, int ip, float* cur, std::vector<float*>& b
   if (swa) { rms(in[0], Ly.attn_norm, x0, T); if (msgs) { rms(in[1], Ly.attn_norm, x1, T); rms(in[2], Ly.attn_norm, x2, T); } else { x1 = x0; x2 = x0; } }
   else { rms(in[0], Ly.q_inp, x0, T); rms(in[1], Ly.k_inp, x1, T); rms(in[2], Ly.v_inp, x2, T); }
   for (float* m : owned) pdec(m);
-  gemm(Ly.wq, x0, q_, T); gemm(Ly.wk, x1, k0_, T); gemm(Ly.wv, x2, v0_, T); gemm(Ly.rel, x0, r_, T); gemm(Ly.sink, x0, sinks_, T); gemm(Ly.gate, x0, gate_, T);
-  if (!swa) { gemm(Ly.kcp, x1, kd_, T); gemm(Ly.vcp, x2, vd_, T); }
-  conv(k0_, Ly.k_conv, swa ? nullptr : kd_, slot, 0, K_, KV); conv(v0_, Ly.v_conv, swa ? nullptr : vd_, slot, 1, V_, KV);
-  k_clip<<<T * NH, 128>>>(q_, D, Ly.q_clip, NH, c.qk_clip); k_clip<<<T * NKV, 128>>>(K_, D, nullptr, NKV, c.qk_clip); k_rms_head<<<T * NKV, 128>>>(V_, D, c.eps);
-  k_clip<<<T * NH, 128>>>(r_, c.n_rel, Ly.rel_clip, NH, c.rel_clip);
-  if (!swa) k_tau<<<T, 256>>>(q_, NH * D, r_, NH * c.n_rel, d_pos_, (float)c.log_floor, c.log_alpha);
+  timed("proj_qkv_rel_gate", [&] { gemm(Ly.wq, x0, q_, T); gemm(Ly.wk, x1, k0_, T); gemm(Ly.wv, x2, v0_, T); gemm(Ly.rel, x0, r_, T); gemm(Ly.sink, x0, sinks_, T); gemm(Ly.gate, x0, gate_, T);
+    if (!swa) { gemm(Ly.kcp, x1, kd_, T); gemm(Ly.vcp, x2, vd_, T); } });
+  timed("conv_kv", [&] { conv(k0_, Ly.k_conv, swa ? nullptr : kd_, slot, 0, K_, KV); conv(v0_, Ly.v_conv, swa ? nullptr : vd_, slot, 1, V_, KV); });
+  timed("clip_norm_tau", [&] { k_clip<<<T * NH, 128>>>(q_, D, Ly.q_clip, NH, c.qk_clip); k_clip<<<T * NKV, 128>>>(K_, D, nullptr, NKV, c.qk_clip); k_rms_head<<<T * NKV, 128>>>(V_, D, c.eps);
+    k_clip<<<T * NH, 128>>>(r_, c.n_rel, Ly.rel_clip, NH, c.rel_clip);
+    if (!swa) k_tau<<<T, 256>>>(q_, NH * D, r_, NH * c.n_rel, d_pos_, (float)c.log_floor, c.log_alpha); });
   dmp("Qcur", slot, q_, NH * D); dmp("Kcur", slot, K_, KV); dmp("Vcur", slot, V_, KV);
   const int cap = swa ? LOCAL_CAP : step_cap_;
-  k_kv_store<<<T, 128>>>(K_, V_, kc_tab_[slot], vc_tab_[slot], d_seq_, d_pos_, cap, KV);
+  timed("kv_store", [&] { k_kv_store<<<T, 128>>>(K_, V_, kc_tab_[slot], vc_tab_[slot], d_seq_, d_pos_, cap, KV); });
   int nsplit = 1, chunk = 1 << 30;
   if (!swa) { const int len = maxpos_ + 1; chunk = std::max(2048, (len + 15) / 16); nsplit = (len + chunk - 1) / chunk; }
   else { chunk = c.n_swa; nsplit = 1; }
+  timed(swa ? "attn_local" : "attn_global", [&] {
   k_attn_part<<<dim3(T * NH, nsplit), 128>>>(q_, r_, sinks_, kc_tab_[slot] ? (const __half* const*)kc_tab_[slot] : nullptr, (const __half* const*)vc_tab_[slot], Ly.rel_bias, d_seq_, d_pos_, NH, NKV, D, c.n_rel, cap,
                                             swa ? c.n_swa : 0, chunk, pm_, pl_, pacc_, nsplit);
   k_attn_combine<<<T * NH, 128>>>(pm_, pl_, pacc_, gate_, att_, NH, D, nsplit);
-  gemm(Ly.wo, att_, o_, T);
-  float* A = pget(); conv(o_, Ly.post_conv, nullptr, slot, 2, A, E);
+  });
+  timed("wo_conv", [&] { gemm(Ly.wo, att_, o_, T); });
+  float* A = pget(); timed("wo_conv", [&] { conv(o_, Ly.post_conv, nullptr, slot, 2, A, E); });
   dmp("attn_out", slot, A, E);
   if (ip % c.block == 0) { blocks.push_back(inpSA); pinc(inpSA); cur = A; }
   else { float* C = pget(); const int n = T * E; k_add<<<(n + 255) / 256, 256>>>(inpSA, A, C, n); pdec(A); cur = C; }
@@ -288,11 +301,14 @@ inline float* Engine::layer(int slot, int ip, float* cur, std::vector<float*>& b
   rms(xm, Ly.ffn_norm, tmp_e_, T); pdec(xm);
   // MoE
   const int NE = c.n_expert, NF = c.n_ff_exp, npairs = T * 8;
+  timed("moe_route", [&] {
   gemm(Ly.gate_inp, tmp_e_, logits_gate_, T);
   const int* forced = nullptr;
   if (force_experts) { std::vector<int> f; if (force_experts(slot, pos_h_, f) && (int)f.size() == T * 8) { HIP_CHECK(hipMemcpy(forced_, f.data(), f.size() * 4, hipMemcpyHostToDevice)); forced = forced_; } }
   k_route<<<T, 128>>>(logits_gate_, Ly.probs_b, NE, 8, c.w_scale, ids_, wts_, forced);
   k_moe_lists<<<NE, 256>>>(ids_, npairs, lists_, counts_);
+  });
+  timed("moe_experts", [&] {
   { constexpr int NT = 4; dim3 g((NF + 7) / 8, (T + NT - 1) / NT, NE);
     if (Ly.gate_up.wt == W_NVFP4) k_moe_gate_up<W_NVFP4, NT><<<g, 256>>>((const uint8_t*)Ly.gate_up.d, E, NF, tmp_e_, lists_, counts_, npairs, Ly.gate_up_s, hid_, c.situ_beta, c.situ_lin);
     else if (Ly.gate_up.wt == W_Q5_K) k_moe_gate_up<W_Q5_K, NT><<<g, 256>>>((const uint8_t*)Ly.gate_up.d, E, NF, tmp_e_, lists_, counts_, npairs, Ly.gate_up_s, hid_, c.situ_beta, c.situ_lin);
@@ -301,6 +317,7 @@ inline float* Engine::layer(int slot, int ip, float* cur, std::vector<float*>& b
     if (Ly.down.wt == W_NVFP4) k_moe_down<W_NVFP4, NT><<<g2, 256>>>((const uint8_t*)Ly.down.d, NF, E, hid_, lists_, counts_, npairs, Ly.down_s, dn_);
     else if (Ly.down.wt == W_Q8_0) k_moe_down<W_Q8_0, NT><<<g2, 256>>>((const uint8_t*)Ly.down.d, NF, E, hid_, lists_, counts_, npairs, Ly.down_s, dn_);
     else throw std::runtime_error("engine: unsupported down type"); }
+  });
   k_moe_combine<<<T, 256>>>(dn_, wts_, moe_, 8, E);
   if (dump) { HIP_CHECK(hipDeviceSynchronize()); std::vector<int> hid(T * 8); HIP_CHECK(hipMemcpy(hid.data(), ids_, T * 8 * 4, hipMemcpyDeviceToHost)); std::vector<float> f(hid.begin(), hid.end()); HIP_CHECK(hipMemcpy(tmp_e2_, f.data(), f.size() * 4, hipMemcpyHostToDevice)); dump("ffn_moe_topk", slot, tmp_e2_, T, 8); }
   dmp("ffn_moe_out", slot, moe_, E);
@@ -352,7 +369,7 @@ inline std::vector<float> Engine::step(const Batch& b) {
   const int nl = (int)b.want_logits.size(); std::vector<float> res((size_t)nl * c.n_vocab_unpadded);
   if (nl) {
     HIP_CHECK(hipMemcpy(d_rows_, b.want_logits.data(), nl * 4, hipMemcpyHostToDevice)); k_gather_rows<<<nl, 256>>>(tmp_e_, d_rows_, d_logit_in_, E);
-    gemm(output_, d_logit_in_, d_logits_, nl, c.n_vocab_unpadded);
+    timed("lm_head", [&] { gemm(output_, d_logit_in_, d_logits_, nl, c.n_vocab_unpadded); });
     const int n = nl * c.n_vocab_unpadded; k_softcap<<<(n + 255) / 256, 256>>>(d_logits_, n, c.softcap);
     HIP_CHECK(hipMemcpy(res.data(), d_logits_, res.size() * 4, hipMemcpyDeviceToHost));
   }

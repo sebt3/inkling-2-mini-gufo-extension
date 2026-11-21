@@ -27,5 +27,10 @@ cd $SRC && mkdir -p $BUILD && time clang++ $HIPFLAGS -O2 -std=c++20 -Wno-unused-
 ls -la $BUILD/inkling_gpu
 X
   ;;
-  *) echo "usage: $0 sync|run|build-ref|build-oracle-dump|build-gpu"; exit 2 ;;
+  build-vision) "$0" run <<'X'
+cd $SRC && mkdir -p $BUILD && clang++ $HIPFLAGS -O2 -std=c++20 -Wno-unused-result -Wno-deprecated-declarations tools/inkling_vision.cpp -o $BUILD/inkling_vision 2>&1 | grep -E "error" -A5 | head -40
+ls -la $BUILD/inkling_vision
+X
+  ;;
+  *) echo "usage: $0 sync|run|build-ref|build-oracle-dump|build-gpu|build-vision"; exit 2 ;;
 esac
