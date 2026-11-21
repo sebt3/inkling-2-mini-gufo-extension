@@ -32,3 +32,13 @@
   prompt; 26.7 tok/s decode with the unoptimised kernels; the component cache captures checkpoints (K/V row components +
   private conv/logits state).
 * Not yet: tools, vision, DSpark, batching (`DecodeBatch`), long-context validation, kernel optimisation, package.
+
+## 2026-11-21 evening: tools, batching validated, state of the numbers
+* M9 tool calls merged (template + scanner, 130/130 against the oracle's `/apply-template`, scanner 33.5k checks) and wired into Gufo:
+  tool dialect `inkling`, prompt tools/tool_calls/tool messages, context-aware markup (`InklingTextRunner::Piece`), streaming, reasoning
+  plus calls, tool-result round trip answering like the oracle. Details and the grammar limitation: `docs/TOOLS.md`.
+* Batching: 4 concurrent requests byte-identical to the sequential run; 56 tok/s aggregate vs 30 tok/s.
+* Decode: ~29-30 tok/s (oracle ~25), 26.5 at 20k depth; prefill ~650 tok/s. Wave-shuffle reductions in rmsnorm/mix/control gate.
+* DSpark: lossless and functional, but acceptance is 10-30 % and speculative decoding is slower than plain decoding (17.6 vs 30 tok/s):
+  verifying 8 tokens touches ~5x more experts, and the drafter head is unoptimised. Do not enable `--speculative` for speed yet.
+  No reference acceptance rate: building the unmerged llama.cpp PR (#32218) to get one was not run (sandbox policy); the question stays open.
