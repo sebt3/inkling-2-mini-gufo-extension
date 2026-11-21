@@ -135,7 +135,9 @@ class InklingTextRunner final : public ext::HipTextModelRunner {
     };
   }
 
-  std::vector<ext::TextExecutionPlan> SupportedPlans() const override { return {{.kind = ext::TextExecutionPlanKind::kSerial, .physical_width = 1}}; }
+  std::vector<ext::TextExecutionPlan> SupportedPlans() const override {
+    return {{.kind = ext::TextExecutionPlanKind::kSerial, .physical_width = 1}, {.kind = ext::TextExecutionPlanKind::kBatched, .physical_width = 8}};
+  }
 
   std::unique_ptr<ext::ComponentCacheResources> CreateComponentCacheResources(cache::ResourceLedger& ledger, std::size_t) const override {
     return hip::CreateHipComponentCacheResources(std::make_unique<InklingContinuationAdapter>(engine_, max_context_, identity_), ledger,
@@ -261,6 +263,49 @@ class InklingTextRunner final : public ext::HipTextModelRunner {
     if (!s.session().Append({&input, 1}, &error)) { s.Invalidate(); throw std::runtime_error("Inkling decode failed: " + error); }
     if ((int)token == think_open_) s.set_thinking(true); else if ((int)token == end_message_) s.set_thinking(false);
     s.set_position(s.position() + 1);
+  }
+
+  // One token for each of several sessions in a single engine pass. Speculative sessions and sessions with a pending token go one by one.
+  void AdvanceBatch(std::span<const ext::TextRunnerAdvance> advances) const override {
+    std::vector<int> seqs, tokens, pos; std::vector<InklingState*> states; std::vector<const ext::TextRunnerAdvance*> rest;
+    for (const auto& a : advances) {
+      auto& s = Require(a.state.get());
+      if (s.session().speculative() || s.pending().has_value() || s.position() >= max_context_) { rest.push_back(&a); continue; }
+      seqs.push_back(s.session().seq()); tokens.push_back((int)a.token); pos.push_back((int)s.position()); states.push_back(&s);
+    }
+    if (!seqs.empty()) {
+      std::vector<std::vector<float>> logits; std::string error;
+      if (!engine_->DecodeBatch(seqs, tokens, pos, &logits, &error)) {
+        for (auto* s : states) s->Invalidate();
+        throw std::runtime_error("Inkling batched decode failed: " + error);
+      }
+      for (std::size_t i = 0; i < states.size(); ++i) {
+        states[i]->session().CommitDecoded(std::move(logits[i]));
+        if (tokens[i] == think_open_) states[i]->set_thinking(true); else if (tokens[i] == end_message_) states[i]->set_thinking(false);
+        states[i]->set_position(states[i]->position() + 1);
+      }
+    }
+    for (const auto* a : rest) Advance(a->state.get(), a->token);
+  }
+
+  // Plain sessions: sample each one's next token, then advance all of them together; the rest use their own DecodeStep.
+  std::vector<ext::TextDecodeStep> DecodeBatch(std::span<const ext::TextRunnerDecode> decodes) const override {
+    std::vector<ext::TextDecodeStep> out(decodes.size()); std::vector<ext::TextRunnerAdvance> adv; std::vector<std::size_t> adv_idx;
+    for (std::size_t i = 0; i < decodes.size(); ++i) {
+      auto& d = decodes[i]; auto& s = Require(d.state.get());
+      if (s.session().speculative() || d.max_tokens != 1 || s.pending().has_value()) { try { out[i] = DecodeStep(d.state.get(), d.max_tokens, d.sampler.get()); } catch (...) { out[i].failure = std::current_exception(); } continue; }
+      try {
+        if (s.position() >= max_context_) { out[i].stop = true; continue; }
+        auto sel = SelectNext(d.state.get(), d.sampler.get());
+        if (sel.stop) { out[i].stop = true; out[i].terminal_logprobs = std::move(sel.logprobs); continue; }
+        adv.push_back({d.state, sel.token, &out[i].failure}); adv_idx.push_back(i); out[i].selections.push_back(std::move(sel));
+        out[i].execution_plan = {ext::TextExecutionPlanKind::kBatched, 8};
+      } catch (...) { out[i].failure = std::current_exception(); }
+    }
+    if (!adv.empty()) {
+      try { AdvanceBatch(adv); } catch (...) { for (auto i : adv_idx) out[i].failure = std::current_exception(); }
+    }
+    return out;
   }
 
   // Consume a token that was sampled and emitted but not yet fed to the session, so the state can move one token at a time again.

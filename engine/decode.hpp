@@ -9,6 +9,21 @@ namespace inkling::gpu {
 struct GJob { const uint8_t* W; const float* X; float* Y; int wt, K, N; };
 struct GJobs { GJob j[8]; int n; };
 
+// x is staged in LDS with a stride of 33 floats per 32-element item: lanes read different items, a stride of 32 would put them on one bank
+constexpr int XS_MAX = 144;   // items: K <= 4608
+__device__ inline float dotrow_lds(int wt, const uint8_t* row, int K, const float* xs, int lane) {
+  float acc = 0.f; const int nit = K / 32;
+  for (int it = lane; it < nit; it += kWave) {
+    float w[32];
+    switch (wt) { case W_Q8_0: dq32<W_Q8_0>(row, it, w, K); break; case W_BF16: dq32<W_BF16>(row, it, w, K); break; case W_F32: dq32<W_F32>(row, it, w, K); break;
+      case W_NVFP4: dq32<W_NVFP4>(row, it, w, K); break; default: dq32<W_Q5_K>(row, it, w, K); break; }
+    const float* xv = xs + it * 33; float s = 0.f;
+#pragma unroll
+    for (int k = 0; k < 32; ++k) s += w[k] * xv[k];
+    acc += s;
+  }
+  return wave_sum(acc);
+}
 __device__ inline float dotrow_any(int wt, const uint8_t* row, int K, const float* x, int lane) {
   float acc = 0.f; const int nit = K / 32;
   for (int it = lane; it < nit; it += kWave) {
@@ -27,8 +42,11 @@ __global__ void k_multi_gemv(GJobs J) {
   int b = blockIdx.x, ji = 0;
   for (; ji < J.n; ++ji) { const int nb = (J.j[ji].N + 7) / 8; if (b < nb) break; b -= nb; }
   if (ji >= J.n) return;
-  const GJob& j = J.j[ji]; const int wave = threadIdx.x / kWave, lane = threadIdx.x % kWave, r = b * 8 + wave; if (r >= j.N) return;
-  const float v = dotrow_any(j.wt, j.W + (size_t)r * row_bytes_of(j.wt, j.K), j.K, j.X, lane);
+  const GJob& j = J.j[ji]; const int wave = threadIdx.x / kWave, lane = threadIdx.x % kWave, r = b * 8 + wave;
+  __shared__ float xs[XS_MAX * 33];
+  for (int i = threadIdx.x; i < j.K; i += blockDim.x) xs[(i / 32) * 33 + (i % 32)] = j.X[i];
+  __syncthreads(); if (r >= j.N) return;
+  const float v = dotrow_lds(j.wt, j.W + (size_t)r * row_bytes_of(j.wt, j.K), j.K, xs, lane);
   if (lane == 0) j.Y[r] = v;
 }
 
@@ -87,6 +105,36 @@ __global__ void k_route_lists1(const float* logits, const float* bias, int NE, i
     float ws = 0.f; for (int k = 0; k < NU; ++k) ws += p[chosen[k]]; ws += 1e-20f;
     for (int k = 0; k < NU; ++k) { ids[k] = chosen[k]; wts[k] = p[chosen[k]] / ws * wscale; counts[chosen[k]] = 1; lists[(size_t)chosen[k] * npairs] = k; }
   }
+}
+
+// ---- single-token MoE, pair-major: one block row per chosen expert instead of launching all 128 experts' (mostly empty) blocks
+template <int WT>
+__global__ void k_moe_gu1(const uint8_t* W, int K, int NF, const float* X, const int* ids, const float* scales, float* hid, float beta, float lin) {
+  __shared__ float xs[XS_MAX * 33]; const int k = blockIdx.y, e = ids[k], wave = threadIdx.x / kWave, lane = threadIdx.x % kWave, f = blockIdx.x * 8 + wave;
+  for (int i = threadIdx.x; i < K; i += blockDim.x) xs[(i / 32) * 33 + (i % 32)] = X[i];
+  __syncthreads(); if (f >= NF) return;
+  const size_t rb = row_bytes_of(WT, K); const uint8_t* Wg = W + ((size_t)e * 2 * NF + f) * rb; const uint8_t* Wu = W + ((size_t)e * 2 * NF + NF + f) * rb;
+  float ag = 0.f, au = 0.f;
+  for (int it = lane; it < K / 32; it += kWave) {
+    float wg[32], wu[32]; dq32<WT>(Wg, it, wg, K); dq32<WT>(Wu, it, wu, K); const float* xv = xs + it * 33; float sg = 0.f, su = 0.f;
+#pragma unroll
+    for (int q = 0; q < 32; ++q) { sg += wg[q] * xv[q]; su += wu[q] * xv[q]; }
+    ag += sg; au += su;
+  }
+  float g = wave_sum(ag), u = wave_sum(au);
+  if (lane == 0) { const float sc = scales ? scales[e] : 1.f; g *= sc; u *= sc; const float act = beta * tanhf(g / beta) / (1.f + expf(-g)); hid[(size_t)k * NF + f] = act * (lin * tanhf(u / lin)); }
+}
+template <int WT>
+__global__ void k_moe_dn1(const uint8_t* W, int K, int N, const float* hid, const int* ids, const float* scales, float* dn) {
+  __shared__ float xs[XS_MAX * 33]; const int k = blockIdx.y, e = ids[k], wave = threadIdx.x / kWave, lane = threadIdx.x % kWave, r = blockIdx.x * 8 + wave;
+  for (int i = threadIdx.x; i < K; i += blockDim.x) xs[(i / 32) * 33 + (i % 32)] = hid[(size_t)k * K + i];
+  __syncthreads(); if (r >= N) return;
+  const uint8_t* row = W + ((size_t)e * N + r) * row_bytes_of(WT, K); float a = 0.f;
+  for (int it = lane; it < K / 32; it += kWave) { float w[32]; dq32<WT>(row, it, w, K); const float* xv = xs + it * 33; float s = 0.f;
+#pragma unroll
+    for (int q = 0; q < 32; ++q) s += w[q] * xv[q];
+    a += s; }
+  const float v = wave_sum(a); if (lane == 0) dn[(size_t)k * N + r] = v * (scales ? scales[e] : 1.f);
 }
 
 }  // namespace inkling::gpu

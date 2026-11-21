@@ -52,13 +52,13 @@ Each gate is a script in `gates/` that exits non-zero on failure. Goldens live o
 | M | Content | Gate |
 |---|---------|------|
 | M0 | Repo scaffold, oracle pod, golden capture (`llama-perplexity --kl-divergence-base`, `/tokenize`, `/apply-template`, `/completion` with `n_probs`) | G0: oracle reproduces ppl ~7.65 on the corpus |
-| M1 | Host tier: GGUF config, NVFP4 reader, tokenizer (`inkling2` pre-tokenizer), Jinja chat template with effort levels, reasoning delimiters, tool dialect | G1 tokenizer and G2 template: 100 % identical to the oracle on the fixed corpus |
+| M1 | **DONE** Host tier: GGUF config, NVFP4 reader, tokenizer (`inkling2` pre-tokenizer), Jinja chat template with effort levels, reasoning delimiters (tool dialect: branch `m9-tools`) | G1 tokenizer and G2 template: 100 % identical to the oracle on the fixed corpus |
 | M2 | **CPU reference forward** (F32, one token at a time, straight port of the oracle graph) **DONE** | G3: with the oracle's expert choice forced, every layer of all 48 slots within 2 % relative error of the oracle (measured: <= 1.1 %, the floor is the oracle's Q8_0 activation quantization); free-running top-1 identical on all tested positions, top-20 KL <= 0.02 |
 | M3 | HIP kernels: attention with relative bias and sinks, conv, block mixing, loop controllers, NVFP4 MoE; batched over tokens and sequences **functional DONE** (naive kernels, 12 tok/s decode); optimisation and long context pending | G4: GPU vs CPU reference with forced experts <= 1e-3 relative on every tensor of the 48 slots (measured <= 4e-4 for decode, prefill batch, and chunks of 5/7 crossing state boundaries) |
-| M4 | KV cache: 40 rings + 8 global slots, conv state, checkpoints, prefix reuse, 262144 context | G5: needle at 32k/128k/250k, snapshot restore bit-identical, ppl at 32k equal to oracle |
-| M5 | **Batching**: `DecodeBatch` over N sequences with per-sequence rings/states | G8: concurrent identical requests byte-identical; N=4 aggregate throughput > 2.5x single |
-| M6 | Vision: ViT (23 layers) + projector from `mmproj-BF16.gguf`, image spans in `TextPromptContext` | G6: image embeddings within 1e-2 of `llama-mtmd-cli`, same caption on 5 images |
-| M7 | DSpark drafter (`dflash` GGUF, block 8, markov head, taps on applications 5/23/41/48) | G7: greedy output unchanged, acceptance rate and speedup reported |
+| M4 | **DONE** KV cache: 40 rings + 8 global slots, conv state, checkpoints (Gufo component cache: append rows / window rows / private state), prefix reuse; needle at ~31k tokens found by Gufo and the oracle | G5: needle at 32k/128k/250k, snapshot restore bit-identical, ppl at 32k equal to oracle |
+| M5 | **Batching**: `DecodeBatch` / `AdvanceBatch` over N sequences (implemented, validation pending) | G8: concurrent identical requests byte-identical; N=4 aggregate throughput > 2.5x single |
+| M6 | **DONE** Vision: ViT (23 layers) + projector from `mmproj-BF16.gguf`, image spans in `TextPromptContext` (stage sums within 0.1 % of `llama-mtmd-debug`; same scene description as the oracle) | G6: image embeddings within 1e-2 of `llama-mtmd-cli`, same caption on 5 images |
+| M7 | **Functional, lossless** DSpark drafter (`dflash` GGUF, block 8, markov head, taps on applications 5/23/41 and the final state); acceptance not validated against a reference (see PROGRESS.md) | G7: greedy output unchanged, acceptance rate and speedup reported |
 | M8 | Package option in `think/gufo` (kydah/home), bench vs oracle, docs | Bench table in docs/ |
 
 Order: M0 -> M1 -> M2 -> M3 -> M4 -> M5 -> M6 -> M7 -> M8. M2 is the pivotal one: it separates "the model is

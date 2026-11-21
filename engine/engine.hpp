@@ -400,7 +400,7 @@ inline float* Engine::layer(int slot, int ip, float* cur, std::vector<float*>& b
   const int NE = c.n_expert, NF = c.n_ff_exp, npairs = T * 8;
   timed("moe_route", [&] {
   gemm(Ly.gate_inp, tmp_e_, logits_gate_, T, -1, true);
-  if (fast) { k_route_lists1<<<1, 128>>>(logits_gate_, Ly.probs_b, NE, 8, c.w_scale, ids_, wts_, lists_, counts_, npairs); } else {
+  if (fast) { k_route<<<1, 128>>>(logits_gate_, Ly.probs_b, NE, 8, c.w_scale, ids_, wts_, nullptr); } else {
   const int* forced = nullptr;
   if (force_experts) { std::vector<int> f; if (force_experts(slot, pos_h_, f) && (int)f.size() == T * 8) { HIP_CHECK(hipMemcpy(forced_, f.data(), f.size() * 4, hipMemcpyHostToDevice)); forced = forced_; } }
   k_route<<<T, 128>>>(logits_gate_, Ly.probs_b, NE, 8, c.w_scale, ids_, wts_, forced);
@@ -408,6 +408,13 @@ inline float* Engine::layer(int slot, int ip, float* cur, std::vector<float*>& b
   }
   });
   timed("moe_experts", [&] {
+  if (fast) {   // one token: only the 8 chosen experts, no per-expert lists
+    dim3 g1((NF + 7) / 8, 8), g2((E + 7) / 8, 8);
+    if (Ly.gate_up.wt == W_NVFP4) k_moe_gu1<W_NVFP4><<<g1, 256>>>((const uint8_t*)Ly.gate_up.d, E, NF, tmp_e_, ids_, Ly.gate_up_s, hid_, c.situ_beta, c.situ_lin);
+    else k_moe_gu1<W_Q5_K><<<g1, 256>>>((const uint8_t*)Ly.gate_up.d, E, NF, tmp_e_, ids_, Ly.gate_up_s, hid_, c.situ_beta, c.situ_lin);
+    if (Ly.down.wt == W_NVFP4) k_moe_dn1<W_NVFP4><<<g2, 256>>>((const uint8_t*)Ly.down.d, NF, E, hid_, ids_, Ly.down_s, dn_);
+    else k_moe_dn1<W_Q8_0><<<g2, 256>>>((const uint8_t*)Ly.down.d, NF, E, hid_, ids_, Ly.down_s, dn_);
+  } else
   if (use_wmma && T >= 32) {   // grouped matrix-core GEMMs: ~64 tokens per expert tile
     dim3 g((NF + 31) / 32, (T + 63) / 64, NE), g2((E + 63) / 64, (T + 63) / 64, NE);
     if (Ly.gate_up.wt == W_NVFP4) k_wmma_moe_gate_up<W_NVFP4><<<g, 128>>>((const uint8_t*)Ly.gate_up.d, E, NF, tmp_e_, lists_, counts_, npairs, Ly.gate_up_s, hid_, c.situ_beta, c.situ_lin);

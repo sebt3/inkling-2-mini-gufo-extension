@@ -51,6 +51,8 @@ class Session {
     if (dseq_ >= 0) engine_->DSparkInject(dseq_, (long)batch_pos_, (int)keep);
     position_ = batch_pos_ + keep;
   }
+  // result of a batched one-token decode step (see GpuEngine::DecodeBatch): the token is already in the caches
+  void CommitDecoded(std::vector<float>&& logits) { logits_ = std::move(logits); ++position_; }
   void Reset() { engine_->ResetSeq(seq_); position_ = 0; logits_.clear(); if (dseq_ >= 0) engine_->DSparkReset(dseq_, 0); }
 
   // Private state = convolution histories followed by the logits (f32), the layout of the continuation component.
