@@ -24,3 +24,11 @@
   affected; a base64 blob of tens of kilobytes would be. A linear hand-written matcher is the fix; the oracle has the
   same cost.
 * Run both gates: `tools/m1_gates.sh` (the oracle pod must be up on infra-m1).
+
+## 2026-11-21 night: Gufo integration works
+* M1 merged (tokenizer 340/340, chat template 113/113 against the oracle; re-run and confirmed).
+* `gufo extension install` builds the module (host/HIP/text tiers, ICU linked); `gufo serve llm -m <Q4_K_M gguf>` loads in
+  2.2 s and answers `/v1/chat/completions`: greedy output (reasoning + content) is identical to the oracle's on a first
+  prompt; 26.7 tok/s decode with the unoptimised kernels; the component cache captures checkpoints (K/V row components +
+  private conv/logits state).
+* Not yet: tools, vision, DSpark, batching (`DecodeBatch`), long-context validation, kernel optimisation, package.
