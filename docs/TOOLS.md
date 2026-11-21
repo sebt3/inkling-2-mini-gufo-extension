@@ -118,3 +118,19 @@ TREE=m9 tools/m9_gates.sh scan                      # scanner tests only
 ```
 
 The C++ runs in the dev pod (`tools/dev.sh`); the oracle is queried from `infra-m1`.
+
+## Gufo integration (M9b)
+
+* `PreparePrompt` maps `ChatRequest` tools, assistant `tool_calls` and tool messages onto `host/chat_template`; the rendered prompt is
+  byte-identical to the oracle's (checked on a tool round trip). `INKLING_LOG_PROMPT=1` prints each rendered prompt, `INKLING_LOG_TOKENS=1`
+  each sampled token (debugging).
+* A `ToolDialect` with id `inkling` (`gufo/provider.cpp`) wires `host/tool_scan` into the host's parsers (buffered and streamed). The
+  scanner also accepts the **bare** form `<|message_model|>NAME<|content_invoke_tool_json|>{ARGS}`: unconstrained, the model writes the
+  arguments object directly, the `{"name":...,"args":...}` wrapper only appears under the oracle's grammar.
+* Markup visibility (`InklingTextRunner::Piece`, a four-phase machine): answer headers (`<|message_model|><|content_text|>`) stay hidden;
+  a thinking block opens with the whole `<|message_model|><|content_thinking|>` (this is also the reasoning opener declared to the host);
+  a tool call keeps its entire markup, `<|message_model|>` being released with the first token of the call header.
+* **No constrained calls.** The host's grammar for a call opened by `<|message_model|>` would also swallow every answer block, so the
+  dialect declares a dummy opener the model never writes (generation stays free; the scanner starts on the real header).
+  `tool_choice: required` and a forced tool are refused with a clear error; `auto` and `none` work, with reasoning, streaming and
+  multiple calls. Constrained calls would need a grammar that can tell `<|message_model|>NAME` from `<|message_model|><|content_text|>`.

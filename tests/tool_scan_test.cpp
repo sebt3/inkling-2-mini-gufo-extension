@@ -145,8 +145,13 @@ void explicit_cases() {
   expect("bad escape", call_text("f", "\"s\":\"\\q\""), false, {});
   expect("raw control char", "<|message_model|>f<|content_invoke_tool_json|>{\"name\":\"f\",\"args\":{\"s\":\"a\nb\"}}<|end_message|>",
          false, {});
-  expect("spaces between tokens (not the template form)", "<|message_model|>f<|content_invoke_tool_json|>{\"name\": \"f\"}<|end_message|>",
-         false, {});
+  expect("bare object with a parameter called name", "<|message_model|>f<|content_invoke_tool_json|>{\"name\": \"f\"}<|end_message|>",
+         false, {{"f", {{"name", "f", true}}, true}});
+  expect("bare arguments (unconstrained model)", "<|message_model|>f<|content_invoke_tool_json|>{\"city\":\"Paris\",\"n\":2}<|end_message|>",
+         false, {{"f", {{"city", "Paris", true}, {"n", "2", false}}, true}});
+  expect("bare empty arguments", "<|message_model|>f<|content_invoke_tool_json|>{}<|end_message|>", false, {{"f", {}, true}});
+  expect("wrapper with spaces", "<|message_model|>f<|content_invoke_tool_json|>{\"name\": \"f\", \"args\": {\"x\": 1}}<|end_message|>",
+         false, {{"f", {{"x", "1", false}}, true}});
   expect("malformed then valid", "<|message_model|>f<|content_invoke_tool_json|>{\"name\":\"f\",\"args\":{\"x\":}}<|end_message|>" +
          call_text("g", "\"y\":2"), false, {{"g", {{"y", "2", false}}, true}});
   // closing without the end marker

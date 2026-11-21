@@ -10,7 +10,7 @@ What it does:
 * **vision** (ViT encoder + projector of the `mmproj` file, images in chat messages);
 * **DSpark** speculative decoding (block drafter + Markov head, lossless verification);
 * **continuous batching** (`--sessions N`, one token per session in a single engine pass);
-* tool calls: see `docs/TOOLS.md` (work in progress on the `m9-tools` branch).
+* **tool calls** (auto mode, parallel calls, streaming, reasoning; no constrained calls yet): see `docs/TOOLS.md`.
 
 Status and measurements are in [PLAN.md](PLAN.md) and [PROGRESS.md](PROGRESS.md); the design in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 

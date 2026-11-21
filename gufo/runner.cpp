@@ -23,6 +23,8 @@
 
 #include "../core/gguf.hpp"
 #include "../host/chat_template.hpp"
+#include "../host/json.hpp"
+#include "../host/tool_scan.hpp"
 #include "../host/tokenizer.hpp"
 #include <gufo/ext/sha256.hpp>
 #include "src/core/image.hpp"
@@ -63,17 +65,17 @@ struct PromptContext final : ext::TextPromptContext {
 class InklingState final : public ext::TextRunnerState {
  public:
   InklingState(Session& session, cache::Adapter& adapter, cache::Slot& slot) : session_(&session), adapter_(&adapter), slot_(&slot) {}
-  void Invalidate() noexcept override { position_ = 0; thinking_ = false; pending_.reset(); (void)adapter_->Invalidate(*slot_); }
+  void Invalidate() noexcept override { position_ = 0; phase_ = 0; pending_.reset(); (void)adapter_->Invalidate(*slot_); }
   Session& session() const { return *session_; }
   std::size_t position() const noexcept { return position_; }
   void set_position(std::size_t p) noexcept { position_ = p; }
-  bool thinking() const noexcept { return thinking_; }
-  void set_thinking(bool v) noexcept { thinking_ = v; }
+  int phase() const noexcept { return phase_; }   // see InklingTextRunner::Piece
+  void set_phase(int v) noexcept { phase_ = v; }
   std::optional<std::int32_t>& pending() noexcept { return pending_; }
   const PromptContext* context() const noexcept { return context_.get(); }
   void set_context(std::shared_ptr<const ext::TextPromptContext> c) { context_ = std::static_pointer_cast<const PromptContext>(c); }
  private:
-  Session* session_; cache::Adapter* adapter_; cache::Slot* slot_; std::size_t position_{0}; bool thinking_{false};
+  Session* session_; cache::Adapter* adapter_; cache::Slot* slot_; std::size_t position_{0}; int phase_{0};
   std::shared_ptr<const PromptContext> context_;
   std::optional<std::int32_t> pending_;
 };
@@ -107,7 +109,7 @@ class InklingTextRunner final : public ext::HipTextModelRunner {
     think_open_ = tokenizer_->token_id("<|content_thinking|>");
     end_message_ = tokenizer_->token_id("<|end_message|>");
     image_pad_ = tokenizer_->token_id("<|unused_200054|>");
-    hidden_ = {tokenizer_->token_id("<|message_model|>"), tokenizer_->token_id("<|content_text|>"), stop_};
+    message_model_ = tokenizer_->token_id("<|message_model|>"); content_text_ = tokenizer_->token_id("<|content_text|>");
   }
 
   ext::TextRunnerDescriptor Descriptor() const override {
@@ -165,10 +167,11 @@ class InklingTextRunner final : public ext::HipTextModelRunner {
   }
 
   std::optional<ext::TextPreparedPrompt> PreparePrompt(const ext::ChatRequest& request) const override {
-    if (!request.tools.empty() && request.tool_choice != ext::ChatRequest::ToolChoice::kNone) throw std::invalid_argument("Inkling tool calls are not supported yet");
+    const bool tools_on = !request.tools.empty() && request.tool_choice != ext::ChatRequest::ToolChoice::kNone;
+    if (tools_on && (request.tool_choice == ext::ChatRequest::ToolChoice::kRequired || !request.forced_tool_name.empty()))
+      throw std::invalid_argument("Inkling does not support constrained tool calls (tool_choice required or a forced tool) yet");
     std::vector<::inkling::Message> messages; std::vector<std::shared_ptr<const ImageEmbedding>> images;
     for (const auto& m : request.messages) {
-      if (!m.tool_calls.empty()) throw std::invalid_argument("Inkling tool calls are not supported yet");
       const std::string text = m.content + m.framing_suffix;
       ::inkling::Message out;
       if (m.images.empty()) out = ::inkling::Message::make(RoleName(m.role), text);
@@ -185,12 +188,28 @@ class InklingTextRunner final : public ext::HipTextModelRunner {
         }
         if (pos < text.size()) out.parts.push_back({"text", text.substr(pos)});
       }
-      out.reasoning_content = m.thought; out.name = m.name; messages.push_back(std::move(out));
+      out.reasoning_content = m.thought; out.name = m.name; out.tool_call_id = m.tool_call_id;
+      for (const auto& c : m.tool_calls) {
+        ::inkling::ToolCall tc; tc.id = c.id; tc.name = c.name;
+        ::inkling::json::Value args = ::inkling::json::Value::object();
+        for (const auto& a : c.arguments) args.set(a.name, a.is_string ? ::inkling::json::Value::string(a.value) : ::inkling::json::parse(a.value));
+        tc.arguments = std::move(args); out.tool_calls.push_back(std::move(tc));
+      }
+      messages.push_back(std::move(out));
     }
     ::inkling::Options options;
+    if (tools_on) for (const auto& t : request.tools) {
+      namespace js = ::inkling::json;
+      js::Value fn = js::Value::object(); fn.set("name", js::Value::string(t.name)); fn.set("description", js::Value::string(t.description));
+      fn.set("parameters", js::parse(t.parameters_json.empty() ? "{}" : t.parameters_json));
+      js::Value def = js::Value::object(); def.set("type", js::Value::string("function")); def.set("function", std::move(fn));
+      options.tools.push_back(std::move(def));
+    }
     if (request.reasoning.enabled.has_value() && !*request.reasoning.enabled) options.reasoning_effort = "none";
     else if (request.reasoning.effort.has_value()) options.reasoning_effort = EffortName(*request.reasoning.effort);
-    const std::vector<int> ids = tokenizer_->encode(::inkling::render_prompt(messages, options), true);
+    const std::string rendered = ::inkling::render_prompt(messages, options);
+    if (std::getenv("INKLING_LOG_PROMPT")) std::fprintf(stderr, "[inkling] prompt:\n%s\n[inkling] end prompt\n", rendered.c_str());
+    const std::vector<int> ids = tokenizer_->encode(rendered, true);
     ext::TextPreparedPrompt prepared; auto ctx = std::make_shared<PromptContext>(); std::size_t k = 0;
     for (int id : ids) {
       if (id == image_pad_ && k < images.size()) {   // the placeholder of image k becomes one token per embedding row
@@ -216,8 +235,9 @@ class InklingTextRunner final : public ext::HipTextModelRunner {
 
   // Reasoning arrives as <|message_model|><|content_thinking|>...<|end_message|>; the role and content-kind markers of the
   // answer stay out of the text, the two thinking markers are kept so the host can split reasoning from the answer.
-  ReasoningTags ReasoningBudgetTags() const override { return {"<|content_thinking|>", "<|end_message|>", {"<|end_message|>"}}; }
-  ReasoningMarkup ReasoningDelimiters() const override { return {"<|content_thinking|>", "<|end_message|>"}; }
+  ReasoningTags ReasoningBudgetTags() const override { return {"<|message_model|><|content_thinking|>", "<|end_message|>", {"<|end_message|>"}}; }
+  std::string ToolDialectId() const override { return "inkling"; }
+  ReasoningMarkup ReasoningDelimiters() const override { return {"<|message_model|><|content_thinking|>", "<|end_message|>"}; }
 
   void SetPromptContext(ext::TextRunnerState& state, std::shared_ptr<const ext::TextPromptContext> context) const override { Require(state).set_context(std::move(context)); }
 
@@ -254,14 +274,16 @@ class InklingTextRunner final : public ext::HipTextModelRunner {
     if (logits.empty()) throw std::runtime_error("Inkling token selection has no logits");
     const auto token = static_cast<int>(sampler.Sample(logits));
     if (s.stop_at_eos() && token == stop_) return {.stop = true, .token = 0};
-    return {.stop = false, .token = (TextRunnerToken)token, .piece = Piece(token, s.thinking()), .logprobs = std::nullopt};
+    int ph = s.phase(); std::string piece = Piece(token, ph);
+    if (log_tokens_) std::fprintf(stderr, "[inkling] token %d %s\n", token, tokenizer_->decode({token}).c_str());
+    return {.stop = false, .token = (TextRunnerToken)token, .piece = std::move(piece), .logprobs = std::nullopt};
   }
 
   void Advance(ext::TextRunnerState& state, TextRunnerToken token) const override {
     auto& s = Require(state); FlushPending(s);
     const std::int32_t input = (std::int32_t)token; std::string error;
     if (!s.session().Append({&input, 1}, &error)) { s.Invalidate(); throw std::runtime_error("Inkling decode failed: " + error); }
-    if ((int)token == think_open_) s.set_thinking(true); else if ((int)token == end_message_) s.set_thinking(false);
+    { int ph = s.phase(); (void)Piece((int)token, ph); s.set_phase(ph); }
     s.set_position(s.position() + 1);
   }
 
@@ -281,7 +303,7 @@ class InklingTextRunner final : public ext::HipTextModelRunner {
       }
       for (std::size_t i = 0; i < states.size(); ++i) {
         states[i]->session().CommitDecoded(std::move(logits[i]));
-        if (tokens[i] == think_open_) states[i]->set_thinking(true); else if (tokens[i] == end_message_) states[i]->set_thinking(false);
+        { int ph = states[i]->phase(); (void)Piece(tokens[i], ph); states[i]->set_phase(ph); }
         states[i]->set_position(states[i]->position() + 1);
       }
     }
@@ -324,10 +346,9 @@ class InklingTextRunner final : public ext::HipTextModelRunner {
     if (!s.session().speculative()) return ext::TextModelRunner::DecodeStep(state, max_tokens, sampler);
     ext::TextDecodeStep step; if (max_tokens == 0) return step;
     if (s.position() >= max_context_) { step.stop = true; return step; }
-    bool phase = s.thinking();
+    int phase = s.phase();
     const auto emit = [&](int token) {
       step.selections.push_back(ext::TextDecodeSelection{.stop = false, .token = (TextRunnerToken)token, .piece = Piece(token, phase), .logprobs = std::nullopt});
-      if (token == think_open_) phase = true; else if (token == end_message_) phase = false;
     };
     int anchor;
     if (s.pending().has_value()) anchor = *s.pending();
@@ -335,10 +356,10 @@ class InklingTextRunner final : public ext::HipTextModelRunner {
       auto sel = SelectNext(state, sampler);
       if (sel.stop) { step.stop = true; step.terminal_logprobs = std::move(sel.logprobs); return step; }
       anchor = (int)sel.token; step.selections.push_back(std::move(sel)); s.pending() = anchor;
-      if (anchor == think_open_) phase = true; else if (anchor == end_message_) phase = false;
+      { int ph = s.phase(); (void)Piece(anchor, ph); phase = ph; }
       --max_tokens;
     }
-    s.set_thinking(phase);
+    s.set_phase(phase);
     if (max_tokens == 0) return step;
     sampling::SamplerState tentative = sampler;
     const std::size_t room = max_context_ - s.position();
@@ -362,7 +383,7 @@ class InklingTextRunner final : public ext::HipTextModelRunner {
     sampler.CopyDrawStateFrom(tentative);
     const std::size_t kept = consumed + 1;
     s.session().Rewind(kept); s.session().KeepLogitRow(consumed);
-    s.set_position(s.session().Position()); s.set_thinking(phase);
+    s.set_position(s.session().Position()); s.set_phase(phase);
     step.draft_rounds = k > 0 ? 1 : 0; step.draft_tokens = k; step.stop = stop;
     return step;
   }
@@ -381,11 +402,21 @@ class InklingTextRunner final : public ext::HipTextModelRunner {
     const std::lock_guard lock(image_mutex_); image_cache_.push_back(e); if (image_cache_.size() > 8) image_cache_.erase(image_cache_.begin()); return e;
   }
   static std::vector<TextRunnerToken> ToTokens(const std::vector<int>& ids) { return std::vector<TextRunnerToken>(ids.begin(), ids.end()); }
-  // Text of a generated token: structural markers of the answer are hidden, the thinking open/close markers are shown.
-  std::string Piece(int token, bool thinking) const {
-    if (token == think_open_) return tokenizer_->decode({token});
-    if (token == end_message_) return thinking ? tokenizer_->decode({token}) : std::string();
-    if (std::find(hidden_.begin(), hidden_.end(), token) != hidden_.end()) return {};
+  // Text of a generated token, and the phase after it. Phases: 0 between blocks or in an answer, 1 thinking, 2 right after
+  // <|message_model|> (the kind of block is not known yet), 3 inside a tool call. The structural markers of an answer are hidden; the
+  // thinking markers are shown so the host can split reasoning from the answer; a tool call keeps its whole markup, which the
+  // dialect scanner reads (<|message_model|> is released with the first token of the call header).
+  std::string Piece(int token, int& phase) const {
+    if (token == stop_) return {};
+    if (token == message_model_) { phase = 2; return {}; }
+    if (phase == 2) {
+      if (token == think_open_) { phase = 1; return "<|message_model|>" + tokenizer_->decode({token}); }  // the whole opening of a thinking block
+      if (token == content_text_) { phase = 0; return {}; }
+      phase = 3; return "<|message_model|>" + tokenizer_->decode({token});
+    }
+    if (token == think_open_) { phase = 1; return tokenizer_->decode({token}); }
+    if (token == end_message_) { const bool shown = phase != 0; phase = 0; return shown ? tokenizer_->decode({token}) : std::string(); }
+    if (token == content_text_) return {};
     return tokenizer_->decode({token});
   }
 
@@ -394,7 +425,8 @@ class InklingTextRunner final : public ext::HipTextModelRunner {
   std::uint32_t max_context_;
   cache::Identity identity_;
   int stop_{-1}, think_open_{-1}, end_message_{-1};
-  std::vector<int> hidden_; int image_pad_{-1};
+  bool log_tokens_{std::getenv("INKLING_LOG_TOKENS") != nullptr};
+  int message_model_{-1}, content_text_{-1}; int image_pad_{-1};
   mutable std::mutex image_mutex_; mutable std::vector<std::shared_ptr<ImageEmbedding>> image_cache_;
 };
 

@@ -183,24 +183,39 @@ St raw_value(Cursor& c, bool final, size_t& end) {
 
 struct CallBody {
   std::vector<ToolArg> args;
+  bool last_open = false;     // the last argument is a string cut short
   bool closed = false;        // the outer closing brace was read
   size_t closed_at = 0;       // position after the outer closing brace
   bool end_marker = false;    // the end marker follows the closing brace
   size_t marker_end = 0;      // position after the end marker
 };
 
-// The JSON part of a call, from the cursor (just after the invoke marker) to the end marker.
-St call_body(Cursor& c, bool final, CallBody& body) {
-  St st = literal(c, "{\"name\":");
-  if (st != St::Ok) return st;
-  skip_ws(c);
-  std::string ignored;
-  st = json_string(c, ignored);
-  if (st != St::Ok) return st;
+// The JSON part of a call, from the cursor (just after the invoke marker) to the end marker. Two spellings: the wrapped one the
+// template renders and the grammar of the server forces, {"name":NAME,"args":{...}}, and the bare argument object {...} that the
+// model writes when nothing constrains it. The wrapper is recognised by its exact prefix with the header's own name.
+St call_body(Cursor& c, bool final, CallBody& body, std::string_view header_name) {
   skip_ws(c);
   if (c.at_end()) return St::Incomplete;
-  st = literal(c, ",\"args\":");
-  if (st != St::Ok) return st;
+  bool wrapped = false;
+  {
+    // {"name":NAME,"args": with optional spaces between tokens
+    Cursor probe = c;
+    const auto step = [&](std::string_view lit) { skip_ws(probe); if (probe.at_end()) return St::Incomplete; return literal(probe, lit); };
+    St st = step("{");
+    if (st == St::Ok) st = step("\"name\"");
+    if (st == St::Ok) st = step(":");
+    std::string nm;
+    if (st == St::Ok) { skip_ws(probe); if (probe.at_end()) return St::Incomplete; st = json_string(probe, nm); }
+    if (st == St::Ok) st = step(",");
+    if (st == St::Ok) st = step("\"args\"");
+    if (st == St::Ok) st = step(":");
+    if (st == St::Incomplete) return St::Incomplete;
+    if (st == St::Ok) {
+      (void)header_name;  // a wrapper that names another tool still calls the header's tool, as before
+      wrapped = true; c = probe;
+    }
+  }
+  St st = St::Ok;
   skip_ws(c);
   if (c.at_end()) return St::Incomplete;
   if (c.t[c.i] != '{') return St::Invalid;
@@ -232,6 +247,7 @@ St call_body(Cursor& c, bool final, CallBody& body) {
       st = json_string(c, value);
       if (st == St::Incomplete) {
         body.args.push_back({key, value, true});  // the string read so far
+        body.last_open = true;
         return St::Incomplete;
       }
       if (st != St::Ok) return St::Invalid;
@@ -263,10 +279,12 @@ St call_body(Cursor& c, bool final, CallBody& body) {
     return St::Invalid;
   }
 
-  skip_ws(c);
-  if (c.at_end()) return St::Incomplete;
-  if (c.t[c.i] != '}') return St::Invalid;
-  ++c.i;
+  if (wrapped) {
+    skip_ws(c);
+    if (c.at_end()) return St::Incomplete;
+    if (c.t[c.i] != '}') return St::Invalid;
+    ++c.i;
+  }
   body.closed = true;
   body.closed_at = c.i;
 
@@ -311,7 +329,7 @@ void scan_tool_calls(std::string_view text, std::vector<ToolCallOut>* calls,
     Cursor c{text, lt + kInvoke.size()};
     CallBody body;
     const bool final = !partial;
-    const St st = call_body(c, final, body);
+    const St st = call_body(c, final, body, name);
 
     if (st == St::Invalid) {
       pos = lt;
@@ -322,6 +340,7 @@ void scan_tool_calls(std::string_view text, std::vector<ToolCallOut>* calls,
     call.name = std::string(name);
     if (st == St::Incomplete) {
       call.args = std::move(body.args);
+      call.last_open = body.last_open;
       call.complete = false;
       if (calls) calls->push_back(std::move(call));
       if (spans) spans->push_back({h, text.size()});

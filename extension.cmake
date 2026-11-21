@@ -22,6 +22,8 @@ gufo_extension_target(
   SOURCES
     host/tokenizer.cpp
     host/chat_template.cpp
+    host/json.cpp
+    host/tool_scan.cpp
   LINK_LIBRARIES
     gufo_inkling
     gufo_ext_runtime

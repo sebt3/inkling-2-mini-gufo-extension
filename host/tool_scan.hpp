@@ -19,6 +19,7 @@ struct ToolArg {
 struct ToolCallOut {
   std::string name;  // from the header (the model's own name for the call)
   std::vector<ToolArg> args;
+  bool last_open = false;  // incomplete call whose last argument is a string cut short (its value is the decoded prefix)
   bool complete = true;  // false: the text ends inside this call; args holds what is readable so far
 };
 
