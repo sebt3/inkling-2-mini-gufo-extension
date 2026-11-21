@@ -15,5 +15,10 @@ cd /src/src && mkdir -p /tmp/build && g++ -O3 -march=native -fopenmp -std=c++20 
 ls -la /tmp/build/inkling_ref
 X
   ;;
-  *) echo "usage: $0 sync|run|build-ref"; exit 2 ;;
+  build-oracle-dump) "$0" run <<'X'
+cd /src/src && g++ -O2 -std=c++17 -o /tmp/build/oracle_dump tools/oracle_dump.cpp -I/src/llama.cpp/include -I/src/llama.cpp/ggml/include -L/tmp/llbuild/bin -lllama -lggml -lggml-base -Wl,-rpath,/tmp/llbuild/bin 2>&1 | head -20
+ls -la /tmp/build/oracle_dump
+X
+  ;;
+  *) echo "usage: $0 sync|run|build-ref|build-oracle-dump"; exit 2 ;;
 esac

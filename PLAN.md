@@ -53,7 +53,7 @@ Each gate is a script in `gates/` that exits non-zero on failure. Goldens live o
 |---|---------|------|
 | M0 | Repo scaffold, oracle pod, golden capture (`llama-perplexity --kl-divergence-base`, `/tokenize`, `/apply-template`, `/completion` with `n_probs`) | G0: oracle reproduces ppl ~7.65 on the corpus |
 | M1 | Host tier: GGUF config, NVFP4 reader, tokenizer (`inkling2` pre-tokenizer), Jinja chat template with effort levels, reasoning delimiters, tool dialect | G1 tokenizer and G2 template: 100 % identical to the oracle on the fixed corpus |
-| M2 | **CPU reference forward** (F32, one token at a time, straight port of the oracle graph) | G3: logits within 1e-3 relative of the oracle on 3 prompts, top-20 order identical |
+| M2 | **CPU reference forward** (F32, one token at a time, straight port of the oracle graph) **DONE** | G3: with the oracle's expert choice forced, every layer of all 48 slots within 2 % relative error of the oracle (measured: <= 1.1 %, the floor is the oracle's Q8_0 activation quantization); free-running top-1 identical on all tested positions, top-20 KL <= 0.02 |
 | M3 | HIP kernels: attention with relative bias and sinks, conv, block mixing, loop controllers, NVFP4 MoE; single sequence, dense, up to 32k | G4: mean KLD vs oracle < 0.01 (same weights, expect < 0.002), top-1 agreement >= 99 % |
 | M4 | KV cache: 40 rings + 8 global slots, conv state, checkpoints, prefix reuse, 262144 context | G5: needle at 32k/128k/250k, snapshot restore bit-identical, ppl at 32k equal to oracle |
 | M5 | **Batching**: `DecodeBatch` over N sequences with per-sequence rings/states | G8: concurrent identical requests byte-identical; N=4 aggregate throughput > 2.5x single |
@@ -80,3 +80,13 @@ misunderstood" from "a kernel is wrong". Every kernel in M3 is tested against th
 * Whether sparse attention is worth porting for the 8 global slots at 250k (decode attention cost grows with
   context on those slots only).
 * Reasoning budget behavior: the card says minimum effort does not fully disable reasoning.
+
+## Findings from M2 (what the port got wrong first)
+
+* The relative-position bias minus the sink is folded into the **attention mask** by the oracle, so it is added after
+  the 1/sqrt(d) scaling of q.k. Scaling it too gave attention outputs ~500x too large.
+* Expert selection flips on near-ties (8th vs 9th expert) because the oracle quantizes activations to Q8_0: with the
+  router logits within 0.15 % the top-8 set still differs on a few tokens per layer. Validation therefore uses teacher
+  forcing (`inkling_ref --force-experts DUMPDIR`); free-running agreement is measured on logits/top-k instead.
+* Tools: `tools/oracle_dump` (oracle graph on CPU, F32 KV, no flash attention, dumps named tensors),
+  `tools/inkling_ref --dump`, `gates/compare_dumps.py` (relative error per tensor), `gates/compare_topk.py`.

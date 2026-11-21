@@ -68,6 +68,8 @@ class Model {
   Hparams hp;
   // optional tracing: (name, slot, data) for layer-by-layer comparison
   std::function<void(const char*, int, const Vec&)> trace;
+  // optional teacher forcing: expert ids (in order) to use for (slot, position); return false to select normally
+  std::function<bool(int, int, std::vector<int>&)> force_experts;
 
  private:
   Gguf g_;
@@ -243,12 +245,12 @@ class Model {
         double dot = 0; for (int d = 0; d < D; ++d) dot += (double)q[h * D + d] * kj[d];
         const int dist = pos_ - j; float bias = 0.f;
         if (dist >= 0 && dist < hp.rel_extent) { const float* row = rb + (size_t)dist * hp.n_rel; for (int i = 0; i < hp.n_rel; ++i) bias += row[i] * r[h * hp.n_rel + i]; }
-        lg[j - j0] = ((float)dot + bias - sinks[h]) * scale; mx = std::max(mx, lg[j - j0]);
+        lg[j - j0] = (float)dot * scale + bias - sinks[h];  // the bias is folded into the mask by the oracle: not scaled mx = std::max(mx, lg[j - j0]);
       }
       double sum = std::exp(0.f - mx); for (auto& x : lg) { x = std::exp(x - mx); sum += x; }
       for (int j = j0; j <= pos_; ++j) { float w = (float)(lg[j - j0] / sum); const float* vj = S.V[j].data() + kv * D; for (int d = 0; d < D; ++d) att[h * D + d] += w * vj[d]; }
     }
-    if (trace) trace("attn_core", slot, att);
+    if (trace) trace("kqv_out", slot, att);
     Vec g(NH * D); matvec(*L.gate, in[0].data(), g.data());
     for (int i = 0; i < NH * D; ++i) att[i] *= sigm(g[i]);
     Vec o(E); matvec(*L.wo, att.data(), o.data());
@@ -259,6 +261,7 @@ class Model {
     if (ip % hp.block == 0) blocks.push_back(inpSA);
     else for (int e = 0; e < E; ++e) cur[e] += inpSA[e];
     Vec ffn_inp = cur;
+    if (trace) trace("ffn_inp", slot, ffn_inp);
 
     std::vector<Vec> fm; mix(blocks, cur, L.ffn_res, 1, fm);
     Vec x = fm[0];
@@ -271,9 +274,11 @@ class Model {
     Vec probs(NE), selp(NE); for (int e = 0; e < NE; ++e) { probs[e] = sigm(logits[e]); selp[e] = probs[e] + (L.probs_b ? f32(L.probs_b)[e] : 0.f); }
     std::vector<int> idx(NE); std::iota(idx.begin(), idx.end(), 0);
     std::stable_sort(idx.begin(), idx.end(), [&](int a, int b) { return selp[a] > selp[b]; });
+    if (force_experts) { std::vector<int> f; if (force_experts(slot, pos_, f) && (int)f.size() == NU) for (int i = 0; i < NU; ++i) idx[i] = f[i]; }
     float wsum = 0; for (int i = 0; i < NU; ++i) wsum += probs[idx[i]];
     wsum += 1e-20f;
-    Vec moe(E, 0.f), gu(2 * NF), hid(NF), dn(E);
+    Vec moe(E, 0.f), gu(2 * NF), hid(NF), dn(E), t_gu, t_situ, t_dn, t_w, t_id;
+    if (trace) trace("ffn_moe_logits", slot, logits);
     for (int i = 0; i < NU; ++i) {
       const int e = idx[i]; const float w = probs[e] / wsum * hp.w_scale;
       matvec_expert(*L.gate_up, e, x.data(), gu.data());
@@ -285,9 +290,10 @@ class Model {
       }
       matvec_expert(*L.down, e, hid.data(), dn.data());
       if (L.down_s) { const float s = f32(L.down_s)[e]; for (auto& v : dn) v *= s; }
+      if (trace) { t_gu.insert(t_gu.end(), gu.begin(), gu.end()); t_situ.insert(t_situ.end(), hid.begin(), hid.end()); t_dn.insert(t_dn.end(), dn.begin(), dn.end()); t_w.push_back(w); t_id.push_back((float)e); }
       for (int c = 0; c < E; ++c) moe[c] += w * dn[c];
     }
-    if (trace) trace("moe", slot, moe);
+    if (trace) { trace("ffn_moe_gate_up_scaled", slot, t_gu); trace("ffn_moe_situ", slot, t_situ); trace("ffn_moe_down_scaled", slot, t_dn); trace("ffn_moe_weights_scaled", slot, t_w); trace("ffn_moe_topk", slot, t_id); trace("ffn_moe_out", slot, moe); }
     Vec fo = convolve(moe, L.ffn_post_conv, nullptr, S.conv.f, E);
     for (int e = 0; e < E; ++e) fo[e] += ffn_inp[e];
     if (trace) trace("l_out", slot, fo);
