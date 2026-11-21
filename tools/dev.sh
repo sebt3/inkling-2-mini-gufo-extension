@@ -37,5 +37,10 @@ cd $SRC && mkdir -p $BUILD && clang++ $HIPFLAGS -O2 -std=c++20 -Wno-unused-resul
 ls -la $BUILD/inkling_spec
 X
   ;;
-  *) echo "usage: $0 sync|run|build-ref|build-oracle-dump|build-gpu|build-vision|build-spec"; exit 2 ;;
+  build-wmma) "$0" run <<'X'
+cd $SRC && mkdir -p $BUILD && clang++ $HIPFLAGS -O2 -std=c++20 -Wno-unused-result -Wno-deprecated-declarations tools/wmma_test.cpp -o $BUILD/wmma_test 2>&1 | grep -E "error" -A5 | head -40
+ls -la $BUILD/wmma_test
+X
+  ;;
+  *) echo "usage: $0 sync|run|build-ref|build-oracle-dump|build-gpu|build-vision|build-spec|build-wmma"; exit 2 ;;
 esac

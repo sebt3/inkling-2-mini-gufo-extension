@@ -27,6 +27,7 @@ int main(int argc, char** argv) {
       std::vector<std::vector<float>> rows; if (!eng->AppendRows(s, run.data(), (int)run.size(), pos, &rows, true, true, &err)) { fprintf(stderr, "verify: %s\n", err.c_str()); return 1; }
       int k = (int)dr.size(), j = 0; std::vector<int> emit;
       for (j = 0; j <= k; ++j) { int t = argmax(rows[j]); emit.push_back(t); if (j < k && t == dr[j]) { ++accepted; continue; } break; }
+      if (rounds < 14) { printf("round %ld: anchor=%d drafted:", rounds, anchor); for (int t : dr) printf(" %d", t); printf(" | target:"); for (int jj = 0; jj <= k; ++jj) printf(" %d", argmax(rows[jj])); printf("  (accepted %d)\n", j); }
       int kept = std::min(j + 1, k + 1); if (kept < (int)run.size()) eng->RollbackConv(s, kept);
       eng->DSparkInject(d, pos, kept); pos += kept; ++rounds; drafted += k;
       for (int t : emit) if ((int)spec.size() < N) spec.push_back(t);

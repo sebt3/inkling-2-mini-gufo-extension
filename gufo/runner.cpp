@@ -63,17 +63,19 @@ struct PromptContext final : ext::TextPromptContext {
 class InklingState final : public ext::TextRunnerState {
  public:
   InklingState(Session& session, cache::Adapter& adapter, cache::Slot& slot) : session_(&session), adapter_(&adapter), slot_(&slot) {}
-  void Invalidate() noexcept override { position_ = 0; thinking_ = false; (void)adapter_->Invalidate(*slot_); }
+  void Invalidate() noexcept override { position_ = 0; thinking_ = false; pending_.reset(); (void)adapter_->Invalidate(*slot_); }
   Session& session() const { return *session_; }
   std::size_t position() const noexcept { return position_; }
   void set_position(std::size_t p) noexcept { position_ = p; }
   bool thinking() const noexcept { return thinking_; }
   void set_thinking(bool v) noexcept { thinking_ = v; }
+  std::optional<std::int32_t>& pending() noexcept { return pending_; }
   const PromptContext* context() const noexcept { return context_.get(); }
   void set_context(std::shared_ptr<const ext::TextPromptContext> c) { context_ = std::static_pointer_cast<const PromptContext>(c); }
  private:
   Session* session_; cache::Adapter* adapter_; cache::Slot* slot_; std::size_t position_{0}; bool thinking_{false};
   std::shared_ptr<const PromptContext> context_;
+  std::optional<std::int32_t> pending_;
 };
 
 InklingState& Require(ext::TextRunnerState& s) { auto* p = dynamic_cast<InklingState*>(&s); if (!p) throw std::logic_error("text runner state is not Inkling"); return *p; }
@@ -114,7 +116,7 @@ class InklingTextRunner final : public ext::HipTextModelRunner {
         .model_id = "Inkling-2-Mini",
         .state_abi = std::string(kStateAbi),
         .max_context = max_context_,
-        .capabilities = ext::TextRunnerCapabilities{.supports_vision = engine_->has_vision(), .incremental_prefill = true, .final_token_advance_required = false, .incremental_text_is_exact = true, .prefix_reuse = true},
+        .capabilities = ext::TextRunnerCapabilities{.supports_vision = engine_->has_vision(), .incremental_prefill = true, .final_token_advance_required = false, .incremental_text_is_exact = true, .multi_token_decode = engine_->has_dspark(), .prefix_reuse = true},
         .sampling_defaults = sampling::TextSamplingDefaults{v, v, v},
     };
   }
@@ -254,11 +256,70 @@ class InklingTextRunner final : public ext::HipTextModelRunner {
   }
 
   void Advance(ext::TextRunnerState& state, TextRunnerToken token) const override {
-    auto& s = Require(state);
+    auto& s = Require(state); FlushPending(s);
     const std::int32_t input = (std::int32_t)token; std::string error;
     if (!s.session().Append({&input, 1}, &error)) { s.Invalidate(); throw std::runtime_error("Inkling decode failed: " + error); }
     if ((int)token == think_open_) s.set_thinking(true); else if ((int)token == end_message_) s.set_thinking(false);
     s.set_position(s.position() + 1);
+  }
+
+  // Consume a token that was sampled and emitted but not yet fed to the session, so the state can move one token at a time again.
+  void FlushPending(InklingState& s) const {
+    if (!s.pending().has_value()) return;
+    const std::int32_t t = *s.pending(); s.pending().reset(); std::string error;
+    if (!s.session().Append({&t, 1}, &error)) { s.Invalidate(); throw std::runtime_error("Inkling decode failed: " + error); }
+    s.set_position(s.position() + 1);
+  }
+
+  // Speculative decoding with the DSpark drafter. Each call is one block: the drafter proposes up to 7 tokens after the anchor (the
+  // pending token), one verification pass runs the anchor and the proposals through the target, and a proposal is kept when the target's
+  // own sample at its row equals it, otherwise that sample is the next token: every emitted token is a draw from the target distribution.
+  ext::TextDecodeStep DecodeStep(ext::TextRunnerState& state, std::size_t max_tokens, sampling::SamplerState& sampler) const override {
+    auto& s = Require(state);
+    if (!s.session().speculative()) return ext::TextModelRunner::DecodeStep(state, max_tokens, sampler);
+    ext::TextDecodeStep step; if (max_tokens == 0) return step;
+    if (s.position() >= max_context_) { step.stop = true; return step; }
+    bool phase = s.thinking();
+    const auto emit = [&](int token) {
+      step.selections.push_back(ext::TextDecodeSelection{.stop = false, .token = (TextRunnerToken)token, .piece = Piece(token, phase), .logprobs = std::nullopt});
+      if (token == think_open_) phase = true; else if (token == end_message_) phase = false;
+    };
+    int anchor;
+    if (s.pending().has_value()) anchor = *s.pending();
+    else {
+      auto sel = SelectNext(state, sampler);
+      if (sel.stop) { step.stop = true; step.terminal_logprobs = std::move(sel.logprobs); return step; }
+      anchor = (int)sel.token; step.selections.push_back(std::move(sel)); s.pending() = anchor;
+      if (anchor == think_open_) phase = true; else if (anchor == end_message_) phase = false;
+      --max_tokens;
+    }
+    s.set_thinking(phase);
+    if (max_tokens == 0) return step;
+    sampling::SamplerState tentative = sampler;
+    const std::size_t room = max_context_ - s.position();
+    std::uint32_t k = std::min<std::uint32_t>({7U, (std::uint32_t)(max_tokens - 1), room > 2 ? (std::uint32_t)(room - 2) : 0U});
+    std::vector<int> drafted;
+    if (k > 0) drafted = engine_->DSparkDraft(s.session().dseq(), anchor, (long)s.position(), (int)k);
+    k = (std::uint32_t)drafted.size();
+    std::vector<std::int32_t> run{(std::int32_t)anchor}; run.insert(run.end(), drafted.begin(), drafted.end());
+    std::string error;
+    if (!s.session().AppendAll(run, &error)) { s.Invalidate(); throw std::runtime_error("Inkling decode failed: " + error); }
+    std::uint32_t consumed = 0; bool stop = false;
+    for (std::uint32_t i = 0; i <= k; ++i) {
+      const auto logits = s.session().Logits(i); consumed = i;
+      const int token = (int)tentative.Sample(logits);
+      const bool accepted = i < k && token == drafted[i];
+      if (s.stop_at_eos() && token == stop_) { stop = true; s.pending().reset(); break; }
+      tentative.Accept((sampling::TokenId)token); emit(token);
+      if (accepted) { ++step.draft_accepted_tokens; continue; }
+      s.pending() = token; break;
+    }
+    sampler.CopyDrawStateFrom(tentative);
+    const std::size_t kept = consumed + 1;
+    s.session().Rewind(kept); s.session().KeepLogitRow(consumed);
+    s.set_position(s.session().Position()); s.set_thinking(phase);
+    step.draft_rounds = k > 0 ? 1 : 0; step.draft_tokens = k; step.stop = stop;
+    return step;
   }
 
   std::size_t CheckpointPosition(const ext::TextRunnerState& state) const override { return Require(state).position(); }
@@ -297,12 +358,15 @@ class InklingTextRunner final : public ext::HipTextModelRunner {
 std::shared_ptr<ext::TextModelRunner> CreateInklingTextRunner(const ext::TextRunnerOptions& options, std::string* error) {
   try {
     if (options.model_path.empty()) { if (error) *error = "Inkling requires a model path"; return nullptr; }
-    if (options.speculative.backend != ext::TextSpeculativeBackend::kDisabled) { if (error) *error = "Inkling speculation is not supported yet"; return nullptr; }
+    const bool dspark = options.speculative.backend == ext::TextSpeculativeBackend::kDSpark;
+    if (options.speculative.backend != ext::TextSpeculativeBackend::kDisabled && !dspark) { if (error) *error = "Inkling supports dspark speculation only"; return nullptr; }
+    if (dspark && options.speculative.draft_model_path.empty()) { if (error) *error = "Inkling dspark speculation requires --dspark-model"; return nullptr; }
     std::uint32_t max_context = options.max_context ? options.max_context : kDefaultContext;
     max_context = std::min<std::uint32_t>(max_context, 1048576);
     std::string load_error;
     auto engine = ::inkling::GpuEngine::Load(options.model_path, (int)max_context, &load_error);
     if (!engine) { if (error) *error = "Failed to load Inkling: " + load_error; return nullptr; }
+    if (dspark && !engine->LoadDSpark(options.speculative.draft_model_path, &load_error)) { if (error) *error = "Failed to load the Inkling DSpark drafter: " + load_error; return nullptr; }
     if (!options.vision_model_path.empty() && !engine->LoadVision(options.vision_model_path, &load_error)) { if (error) *error = "Failed to load the Inkling vision projector: " + load_error; return nullptr; }
     ::inkling::Gguf gguf(options.model_path);
     auto tokenizer = std::make_unique<::inkling::Tokenizer>(gguf);

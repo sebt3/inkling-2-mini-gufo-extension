@@ -11,6 +11,7 @@
 #include <vector>
 #include "../core/gguf.hpp"
 #include "kernels.hpp"
+#include "wmma.hpp"
 #include "vision.hpp"
 
 namespace inkling::gpu {
@@ -259,8 +260,15 @@ class Engine {
     constexpr int NT = 4; dim3 grid((N + 7) / 8, (T + NT - 1) / NT);
     k_gemm<WT, NT><<<grid, 256>>>((const uint8_t*)W.d, W.K, N, X, Y, T, nullptr, nullptr, nullptr);
   }
+  template <int WT> void gemm_wmma(const DTensor& W, const float* X, float* Y, int T, int N) {
+    k_wmma_gemm<WT><<<dim3((N + 63) / 64, (T + 63) / 64), 128>>>((const uint8_t*)W.d, W.K, N, X, Y, N, T, nullptr, nullptr, 1.f);
+  }
+  bool use_wmma = std::getenv("INKLING_NO_WMMA") == nullptr;
   void gemm(const DTensor& W, const float* X, float* Y, int T, int N = -1) {
     if (N < 0) N = W.N;
+    if (use_wmma && T >= 16 && W.wt != W_F32 && W.K % 32 == 0) {   // F32 weights (router, loop controllers) keep the exact scalar path
+      switch (W.wt) { case W_BF16: gemm_wmma<W_BF16>(W, X, Y, T, N); return; case W_Q8_0: gemm_wmma<W_Q8_0>(W, X, Y, T, N); return; case W_Q5_K: gemm_wmma<W_Q5_K>(W, X, Y, T, N); return; case W_NVFP4: gemm_wmma<W_NVFP4>(W, X, Y, T, N); return; }
+    }
     switch (W.wt) { case W_F32: gemm_t<W_F32>(W, X, Y, T, N); break; case W_BF16: gemm_t<W_BF16>(W, X, Y, T, N); break; case W_Q8_0: gemm_t<W_Q8_0>(W, X, Y, T, N); break;
       case W_Q5_K: gemm_t<W_Q5_K>(W, X, Y, T, N); break; case W_NVFP4: gemm_t<W_NVFP4>(W, X, Y, T, N); break; }
   }
@@ -341,6 +349,15 @@ inline float* Engine::layer(int slot, int ip, float* cur, std::vector<float*>& b
   k_moe_lists<<<NE, 256>>>(ids_, npairs, lists_, counts_);
   });
   timed("moe_experts", [&] {
+  if (use_wmma && T >= 32) {   // grouped matrix-core GEMMs: ~64 tokens per expert tile
+    dim3 g((NF + 31) / 32, (T + 63) / 64, NE), g2((E + 63) / 64, (T + 63) / 64, NE);
+    if (Ly.gate_up.wt == W_NVFP4) k_wmma_moe_gate_up<W_NVFP4><<<g, 128>>>((const uint8_t*)Ly.gate_up.d, E, NF, tmp_e_, lists_, counts_, npairs, Ly.gate_up_s, hid_, c.situ_beta, c.situ_lin);
+    else if (Ly.gate_up.wt == W_Q5_K) k_wmma_moe_gate_up<W_Q5_K><<<g, 128>>>((const uint8_t*)Ly.gate_up.d, E, NF, tmp_e_, lists_, counts_, npairs, Ly.gate_up_s, hid_, c.situ_beta, c.situ_lin);
+    else throw std::runtime_error("engine: unsupported gate_up type");
+    if (Ly.down.wt == W_NVFP4) k_wmma_moe_down<W_NVFP4><<<g2, 128>>>((const uint8_t*)Ly.down.d, NF, E, hid_, lists_, counts_, npairs, Ly.down_s, dn_);
+    else if (Ly.down.wt == W_Q8_0) k_wmma_moe_down<W_Q8_0><<<g2, 128>>>((const uint8_t*)Ly.down.d, NF, E, hid_, lists_, counts_, npairs, Ly.down_s, dn_);
+    else throw std::runtime_error("engine: unsupported down type");
+  } else
   { constexpr int NT = 4; dim3 g((NF + 7) / 8, (T + NT - 1) / NT, NE);
     if (Ly.gate_up.wt == W_NVFP4) k_moe_gate_up<W_NVFP4, NT><<<g, 256>>>((const uint8_t*)Ly.gate_up.d, E, NF, tmp_e_, lists_, counts_, npairs, Ly.gate_up_s, hid_, c.situ_beta, c.situ_lin);
     else if (Ly.gate_up.wt == W_Q5_K) k_moe_gate_up<W_Q5_K, NT><<<g, 256>>>((const uint8_t*)Ly.gate_up.d, E, NF, tmp_e_, lists_, counts_, npairs, Ly.gate_up_s, hid_, c.situ_beta, c.situ_lin);

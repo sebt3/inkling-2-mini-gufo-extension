@@ -18,5 +18,6 @@ void inkling_provider_register(gufo::ext::Registry& registry) {
       .sampling_defaults = &gufo::models::inkling::InklingTextSamplingDefaults,
       // NVFP4 is an extension-owned quantization: the host reader cannot size it
       .accepts_unsized_tensors = true,
+      .speculative_defaults = {{.backend = "dspark", .max_draft_tokens = 7, .min_draft_tokens = 1, .draft_policy = "", .draft_policies = {}}},
   });
 }
