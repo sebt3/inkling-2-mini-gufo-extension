@@ -12,6 +12,7 @@
 #include "../core/gguf.hpp"
 #include "kernels.hpp"
 #include "wmma.hpp"
+#include "flash.hpp"
 #include "vision.hpp"
 
 namespace inkling::gpu {
@@ -140,7 +141,7 @@ class Engine {
  private:
   Gguf g_; int max_ctx_;
   struct L {
-    DTensor wq, wk, wv, wo, gate, rel, kcp, vcp, sink, gate_inp, gate_up, down;
+    DTensor wq, wk, wv, wo, gate, rel, kcp, vcp, sink, gate_inp, gate_up, down; DTensor rbpad;
     float *q_clip = 0, *rel_bias = 0, *rel_clip = 0, *k_conv = 0, *v_conv = 0, *post_conv = 0, *ffn_post_conv = 0, *attn_norm = 0, *q_inp = 0, *k_inp = 0, *v_inp = 0,
           *attn_res = 0, *ffn_res = 0, *ffn_norm = 0, *probs_b = 0, *gate_up_s = 0, *down_s = 0, *msg_query = 0;
     DTensor c_down[4], c_gain[4], c_forget[4];
@@ -157,7 +158,7 @@ class Engine {
   std::vector<__half**> kc_tab_, vc_tab_; std::vector<float**> hist_tab_;
   // scratch (max batch)
   float *xn_[3], *q_, *k0_, *v0_, *r_, *sinks_, *gate_, *kd_, *vd_, *K_, *V_, *att_, *o_, *tmp_e_, *tmp_e2_, *logits_gate_, *moe_, *wts_, *hid_, *dn_, *ctrl_gate_, *ctrl_low_, *ctrl_a_, *ctrl_b_;
-  float* d_embd_ = nullptr; int* d_emask_ = nullptr;
+  float* d_embd_ = nullptr; int* d_emask_ = nullptr; float *bias_tab_ = nullptr, *rpad_ = nullptr;   // flash attention: bias table [T][NH][1024], padded r
   float* d_feat_ = nullptr;                                   // [MAX_T][4*E] tap features of the last captured batch
   std::vector<float*> vsave_, osave_; bool save_conv_ = false; int save_seq_ = 0, save_T_ = 0;  // rollback data, per (slot, kind)
   float *pm_, *pl_, *pacc_; int *forced_ = nullptr; int *ids_, *lists_, *counts_;
@@ -203,6 +204,7 @@ class Engine {
       Ly.gate = dt(&g_.get(n("attn_gate.weight"))); Ly.rel = dt(&g_.get(n("attn_rel.weight"))); Ly.sink = dt(&g_.get(n("attn_sink_proj.weight")));
       if (opt("attn_k_conv_proj.weight")) { Ly.kcp = dt(opt("attn_k_conv_proj.weight")); Ly.vcp = dt(opt("attn_v_conv_proj.weight")); }
       Ly.gate_inp = dt(&g_.get(n("ffn_gate_inp.weight"))); Ly.gate_up = dt(&g_.get(n("ffn_gate_up_exps.weight"))); Ly.down = dt(&g_.get(n("ffn_down_exps.weight")));
+      { const Tensor* rbT = &g_.get(n("attn_rel_bias.weight")); float* raw = f32v(rbT); float* pad; HIP_CHECK(hipMalloc(&pad, (size_t)1024 * 32 * 4)); k_pad_rb<<<(1024 * 32 + 255) / 256, 256>>>(raw, pad, 1024); HIP_CHECK(hipDeviceSynchronize()); hipFree(raw); Ly.rbpad.d = pad; Ly.rbpad.wt = W_F32; Ly.rbpad.K = 32; Ly.rbpad.N = 1024; }
       Ly.q_clip = f32v(&g_.get(n("attn_q_clip.weight"))); Ly.rel_bias = f32v(&g_.get(n("attn_rel_bias.weight"))); Ly.rel_clip = f32v(&g_.get(n("attn_rel_clip.weight")));
       Ly.k_conv = f32v(&g_.get(n("attn_k_conv.weight"))); Ly.v_conv = f32v(&g_.get(n("attn_v_conv.weight"))); Ly.post_conv = f32v(&g_.get(n("attn_post_conv.weight")));
       Ly.ffn_post_conv = f32v(&g_.get(n("ffn_post_conv.weight"))); Ly.attn_norm = f32v(opt("attn_norm.weight")); Ly.q_inp = f32v(opt("attn_q_inp_norm.weight"));
@@ -231,7 +233,7 @@ class Engine {
     const int NSPLIT = 16; pm_ = dmalloc((size_t)T * c.n_head * NSPLIT); pl_ = dmalloc((size_t)T * c.n_head * NSPLIT); pacc_ = dmalloc((size_t)T * c.n_head * NSPLIT * 128);
     HIP_CHECK(hipMalloc(&ids_, (size_t)T * 8 * 4)); HIP_CHECK(hipMalloc(&forced_, (size_t)T * 8 * 4)); HIP_CHECK(hipMalloc(&lists_, (size_t)c.n_expert * T * 8 * 4)); HIP_CHECK(hipMalloc(&counts_, c.n_expert * 4));
     HIP_CHECK(hipMalloc(&d_tok_, T * 4)); HIP_CHECK(hipMalloc(&d_seq_, T * 4)); HIP_CHECK(hipMalloc(&d_pos_, T * 4)); HIP_CHECK(hipMalloc(&d_first_, MAXSEQ * 4)); HIP_CHECK(hipMalloc(&d_count_, MAXSEQ * 4));
-    HIP_CHECK(hipMalloc(&d_rows_, T * 4)); d_feat_ = dmalloc((size_t)T * 4 * E); d_embd_ = dmalloc((size_t)T * E); HIP_CHECK(hipMalloc(&d_emask_, T * 4)); d_logit_in_ = dmalloc((size_t)T * E); d_logits_ = dmalloc((size_t)MAXSEQ * 4 * c.n_vocab_unpadded);
+    HIP_CHECK(hipMalloc(&d_rows_, T * 4)); bias_tab_ = dmalloc((size_t)T * c.n_head * 1024); rpad_ = dmalloc((size_t)T * c.n_head * 32); d_feat_ = dmalloc((size_t)T * 4 * E); d_embd_ = dmalloc((size_t)T * E); HIP_CHECK(hipMalloc(&d_emask_, T * 4)); d_logit_in_ = dmalloc((size_t)T * E); d_logits_ = dmalloc((size_t)MAXSEQ * 4 * c.n_vocab_unpadded);
   }
   void alloc_tables() {
     const int NS = c.n_slot(); kc_host_.assign(NS, std::vector<__half*>(MAXSEQ, nullptr)); vc_host_.assign(NS, std::vector<__half*>(MAXSEQ, nullptr)); hist_host_.assign(NS * 4, std::vector<float*>(MAXSEQ, nullptr));
@@ -263,11 +265,12 @@ class Engine {
   template <int WT> void gemm_wmma(const DTensor& W, const float* X, float* Y, int T, int N) {
     k_wmma_gemm<WT><<<dim3((N + 63) / 64, (T + 63) / 64), 128>>>((const uint8_t*)W.d, W.K, N, X, Y, N, T, nullptr, nullptr, 1.f);
   }
-  bool use_wmma = std::getenv("INKLING_NO_WMMA") == nullptr;
-  void gemm(const DTensor& W, const float* X, float* Y, int T, int N = -1) {
+  bool use_wmma = std::getenv("INKLING_NO_WMMA") == nullptr; bool use_flash_ = std::getenv("INKLING_NO_FLASH") == nullptr; bool single_seq_ = false; int d_seq0_ = 0;
+  // exact: keep the scalar f32 path (the router: a rounding there would flip expert choices)
+  void gemm(const DTensor& W, const float* X, float* Y, int T, int N = -1, bool exact = false) {
     if (N < 0) N = W.N;
-    if (use_wmma && T >= 16 && W.wt != W_F32 && W.K % 32 == 0) {   // F32 weights (router, loop controllers) keep the exact scalar path
-      switch (W.wt) { case W_BF16: gemm_wmma<W_BF16>(W, X, Y, T, N); return; case W_Q8_0: gemm_wmma<W_Q8_0>(W, X, Y, T, N); return; case W_Q5_K: gemm_wmma<W_Q5_K>(W, X, Y, T, N); return; case W_NVFP4: gemm_wmma<W_NVFP4>(W, X, Y, T, N); return; }
+    if (use_wmma && T >= 16 && !exact && W.K % 32 == 0) {
+      switch (W.wt) { case W_F32: gemm_wmma<W_F32>(W, X, Y, T, N); return; case W_BF16: gemm_wmma<W_BF16>(W, X, Y, T, N); return; case W_Q8_0: gemm_wmma<W_Q8_0>(W, X, Y, T, N); return; case W_Q5_K: gemm_wmma<W_Q5_K>(W, X, Y, T, N); return; case W_NVFP4: gemm_wmma<W_NVFP4>(W, X, Y, T, N); return; }
     }
     switch (W.wt) { case W_F32: gemm_t<W_F32>(W, X, Y, T, N); break; case W_BF16: gemm_t<W_BF16>(W, X, Y, T, N); break; case W_Q8_0: gemm_t<W_Q8_0>(W, X, Y, T, N); break;
       case W_Q5_K: gemm_t<W_Q5_K>(W, X, Y, T, N); break; case W_NVFP4: gemm_t<W_NVFP4>(W, X, Y, T, N); break; }
@@ -325,11 +328,21 @@ inline float* Engine::layer(int slot, int ip, float* cur, std::vector<float*>& b
   int nsplit = 1, chunk = 1 << 30;
   if (!swa) { const int len = maxpos_ + 1; chunk = std::max(2048, (len + 15) / 16); nsplit = (len + chunk - 1) / chunk; }
   else { chunk = c.n_swa; nsplit = 1; }
+  const bool flash = use_flash_ && T >= 16 && single_seq_;
+  if (flash) {
+    timed(swa ? "attn_local" : "attn_global", [&] {
+      k_bias_pad<<<((size_t)T * NH * 32 + 255) / 256, 256>>>(r_, rpad_, (size_t)T * NH);
+      k_wmma_gemm<W_F32><<<dim3(1024 / 64, (T * NH + 63) / 64), 128>>>((const uint8_t*)Ly.rbpad.d, 32, 1024, rpad_, bias_tab_, 1024, T * NH, nullptr, nullptr, 1.f);
+      k_flash_attn<<<dim3((T + 63) / 64, NH), 128>>>(q_, (const __half*)kc_host_[slot][d_seq0_], (const __half*)vc_host_[slot][d_seq0_], bias_tab_, sinks_, gate_, d_pos_, T, NH, NKV, cap, swa ? c.n_swa : 0, att_);
+    });
+  } else
+  {
   timed(swa ? "attn_local" : "attn_global", [&] {
   k_attn_part<<<dim3(T * NH, nsplit), 128>>>(q_, r_, sinks_, kc_tab_[slot] ? (const __half* const*)kc_tab_[slot] : nullptr, (const __half* const*)vc_tab_[slot], Ly.rel_bias, d_seq_, d_pos_, NH, NKV, D, c.n_rel, cap,
                                             swa ? c.n_swa : 0, chunk, pm_, pl_, pacc_, nsplit);
   k_attn_combine<<<T * NH, 128>>>(pm_, pl_, pacc_, gate_, att_, NH, D, nsplit);
   });
+  }
   timed("wo_conv", [&] { gemm(Ly.wo, att_, o_, T); });
   float* A = pget(); timed("wo_conv", [&] { conv(o_, Ly.post_conv, nullptr, slot, 2, A, E); });
   dmp("attn_out", slot, A, E);
@@ -342,7 +355,7 @@ inline float* Engine::layer(int slot, int ip, float* cur, std::vector<float*>& b
   // MoE
   const int NE = c.n_expert, NF = c.n_ff_exp, npairs = T * 8;
   timed("moe_route", [&] {
-  gemm(Ly.gate_inp, tmp_e_, logits_gate_, T);
+  gemm(Ly.gate_inp, tmp_e_, logits_gate_, T, -1, true);
   const int* forced = nullptr;
   if (force_experts) { std::vector<int> f; if (force_experts(slot, pos_h_, f) && (int)f.size() == T * 8) { HIP_CHECK(hipMemcpy(forced_, f.data(), f.size() * 4, hipMemcpyHostToDevice)); forced = forced_; } }
   k_route<<<T, 128>>>(logits_gate_, Ly.probs_b, NE, 8, c.w_scale, ids_, wts_, forced);
@@ -380,10 +393,12 @@ inline float* Engine::layer(int slot, int ip, float* cur, std::vector<float*>& b
 inline std::vector<float> Engine::step(const Batch& b) {
   const int T = (int)b.tokens.size(), E = c.n_embd; if (T > MAX_T) throw std::runtime_error("batch too large");
   std::lock_guard<std::mutex> lk(mu);
+  single_seq_ = true; d_seq0_ = b.seq.empty() ? 0 : b.seq[0]; for (int i = 0; i < T; ++i) if (b.seq[i] != d_seq0_ || (i && b.pos[i] != b.pos[i - 1] + 1)) { single_seq_ = false; break; }
   save_conv_ = b.save_conv; save_seq_ = b.seq.empty() ? 0 : b.seq[0]; save_T_ = T;
   if (save_conv_ && T > 16) throw std::runtime_error("engine: verification batches have at most 16 tokens");
   const bool capf = b.capture_features; int app = 0;
-  auto tap = [&](float* x) { if (capf && (app == 5 || app == 23 || app == 41)) k_copy_cols<<<T_, 256>>>(x, d_feat_, c.n_embd, 4, app == 5 ? 0 : app == 23 ? 1 : 2); ++app; };
+  static const int shift = std::getenv("DS_TAP_SHIFT") ? std::atoi(std::getenv("DS_TAP_SHIFT")) : 0;  // experiment: taps at 5+s, 23+s, 41+s
+  auto tap = [&](float* x) { if (capf && (app == 5 + shift || app == 23 + shift || app == 41 + shift)) k_copy_cols<<<T_, 256>>>(x, d_feat_, c.n_embd, 4, app == 5 + shift ? 0 : app == 23 + shift ? 1 : 2); ++app; };
   T_ = T; pos_h_ = b.pos; maxpos_ = 0; step_cap_ = max_ctx_; for (int p : b.pos) maxpos_ = std::max(maxpos_, p);
   std::vector<int> first(MAXSEQ, 0), count(MAXSEQ, 0);
   for (int t = 0; t < T; ++t) { const int s = b.seq[t]; if (count[s] == 0) first[s] = t; count[s]++; }

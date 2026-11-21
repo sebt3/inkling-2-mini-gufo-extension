@@ -19,13 +19,15 @@ __global__ void k_ds_fuse(const float* feat, float w0, float w1, float w2, float
   for (int i = threadIdx.x; i < E; i += blockDim.x) { const float v = w0 * f[i] + w1 * f[E + i] + w2 * f[2 * E + i] + w3 * f[3 * E + i]; out[t * E + i] = v * r * norm[i]; }
 }
 // per-head rms norm (weight w[128] or none), then NEOX rope on [x_i, x_{i+64}]; x [T][heads][128]
-__global__ void k_ds_headnorm_rope(float* x, int heads, const float* w, const int* pos, float theta, float eps, int rope) {
+__global__ void k_ds_headnorm_rope(float* x, int heads, const float* w, const int* pos, float theta, float eps, int rope, int adjacent) {
   __shared__ float red[64]; const size_t row = (size_t)blockIdx.x * heads + blockIdx.y; float* v = x + row * 128; const int i = threadIdx.x;
-  float a = v[i], b = v[i + 64]; red[i] = a * a + b * b; __syncthreads();
+  // elements held by this thread: NEOX pairs (i, i+64); adjacent pairs (2i, 2i+1)
+  const int ia = adjacent ? 2 * i : i, ib = adjacent ? 2 * i + 1 : i + 64;
+  float a = v[ia], b = v[ib]; red[i] = a * a + b * b; __syncthreads();
   for (int o = 32; o > 0; o >>= 1) { if (i < o) red[i] += red[i + o]; __syncthreads(); }
-  const float r = rsqrtf(red[0] / 128.f + eps); a *= r; b *= r; if (w) { a *= w[i]; b *= w[i + 64]; }
+  const float r = rsqrtf(red[0] / 128.f + eps); a *= r; b *= r; if (w) { a *= w[ia]; b *= w[ib]; }
   if (rope) { const float ang = (float)pos[blockIdx.x] * powf(theta, -2.f * i / 128.f); const float c = cosf(ang), s = sinf(ang); const float na = a * c - b * s, nb = a * s + b * c; a = na; b = nb; }
-  v[i] = a; v[i + 64] = b;
+  v[ia] = a; v[ib] = b;
 }
 __global__ void k_ds_store(const float* K, const float* V, __half* kc, __half* vc, const int* pos, int cap, int kvd) {
   const int t = blockIdx.x; const size_t o = (size_t)(pos[t] % cap) * kvd;
@@ -87,6 +89,7 @@ class DSpark {
  public:
   static constexpr int E = 2304, NL = 3, NH = 24, NKV = 8, FF = 9216, RANK = 256, BLOCK = 8, SWA_CAP = 2048, FULL_CAP = 16384, FULL_WINDOW = 8192, HN = 9;
   explicit DSpark(Engine& eng, const std::string& path) : e_(eng), g_(path) {
+    adj_ = std::getenv("DS_ROPE_ADJACENT") != nullptr;
     if ((int)g_.num("dflash.block_count") != NL || (int)g_.num("dflash.embedding_length") != E || (int)g_.num("dflash.block_size") != BLOCK || (int)g_.num("dflash.dspark.markov_rank") != RANK)
       throw std::runtime_error("dspark: unsupported drafter geometry");
     eps_ = (float)g_.num("dflash.attention.layer_norm_rms_epsilon"); theta_ = (float)g_.num("dflash.rope.freq_base"); window_ = (int)g_.num("dflash.attention.sliding_window") + 1;
@@ -130,7 +133,7 @@ class DSpark {
     for (int l = 0; l < NL; ++l) {
       Layer& L = L_[l]; k_ds_fuse<<<n, 256>>>(feat, fuse_[l][0], fuse_[l][1], fuse_[l][2], fuse_[l][3], L.dflare, fused_, E, eps_);
       e_.gemm(L.kctx, fused_, kk_, n); e_.gemm(L.vctx, fused_, vv_, n);
-      k_ds_headnorm_rope<<<dim3(n, NKV), 64>>>(kk_, NKV, L.kctx_norm, dpos_, theta_, eps_, 1);
+      k_ds_headnorm_rope<<<dim3(n, NKV), 64>>>(kk_, NKV, L.kctx_norm, dpos_, theta_, eps_, 1, adj_);
       k_ds_store<<<n, 256>>>(kk_, vv_, s.k[l], s.v[l], dpos_, s.cap[l], 1024);
     }
     k_ds_fuse<<<n, 256>>>(feat, fuse_[3][0], fuse_[3][1], fuse_[3][2], fuse_[3][3], dspark_norm_, fused_, E, eps_);
@@ -150,8 +153,8 @@ class DSpark {
       Layer& L = L_[l];
       k_rmsnorm<<<BLOCK, 256>>>(X_, L.attn_norm, xn_, E, eps_);
       e_.gemm(L.q, xn_, qb_, BLOCK); e_.gemm(L.k, xn_, kb_, BLOCK); e_.gemm(L.v, xn_, vb_, BLOCK);
-      k_ds_headnorm_rope<<<dim3(BLOCK, NH), 64>>>(qb_, NH, L.q_norm, dpos_, theta_, eps_, 1);
-      k_ds_headnorm_rope<<<dim3(BLOCK, NKV), 64>>>(kb_, NKV, L.k_norm, dpos_, theta_, eps_, 1);
+      k_ds_headnorm_rope<<<dim3(BLOCK, NH), 64>>>(qb_, NH, L.q_norm, dpos_, theta_, eps_, 1, adj_);
+      k_ds_headnorm_rope<<<dim3(BLOCK, NKV), 64>>>(kb_, NKV, L.k_norm, dpos_, theta_, eps_, 1, adj_);
       const long win = swa_[l] ? std::min<long>(window_ - 1, 1 << 30) : (long)FULL_WINDOW;
       const long lo = std::max<long>(s.ctx_from, pos0 - win); const long hi = pos0;
       k_ds_attn<<<dim3(BLOCK, NH), 128>>>(qb_, kb_, vb_, s.k[l], s.v[l], s.cap[l], lo, std::max(hi, lo), BLOCK, NH, NKV, ab_);
@@ -180,7 +183,7 @@ class DSpark {
 
  private:
   struct Layer { float *attn_norm, *q_norm, *k_norm, *kctx_norm, *dflare, *ffn_norm; DTensor q, k, v, o, kctx, vctx, gate, up, down; };
-  Engine& e_; Gguf g_; float eps_, theta_; int window_; bool swa_[NL]; float fuse_[4][4]; Layer L_[NL]; Seq s_[Engine::MAXSEQ];
+  Engine& e_; Gguf g_; float eps_, theta_; int window_; int adj_ = 0; bool swa_[NL]; float fuse_[4][4]; Layer L_[NL]; Seq s_[Engine::MAXSEQ];
   float *out_norm_, *dspark_norm_, *mask_, *joint_b_, *hout_b_; const uint16_t* markov_; DTensor joint_, hout_;
   float *fused_, *kk_, *vv_, *X_, *xn_, *qb_, *kb_, *vb_, *ab_, *ob_, *gb_, *ub_, *db_, *hid_, *anchor_row_, *state_, *joint_buf_, *gates_, *latent_, *corr_, *h2_, *logit_, *pv_, *ctx_vec_;
   int *dpos_, *pi_, *prev_, *toks_; int* dtok_ = ialloc(1);
