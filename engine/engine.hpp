@@ -372,6 +372,11 @@ inline float* Engine::layer(int slot, int ip, float* cur, std::vector<float*>& b
       k_wmma_gemm<W_F32><<<dim3(1024 / 64, (T * NH + 63) / 64), 128>>>((const uint8_t*)Ly.rbpad.d, 32, 1024, rpad_, bias_tab_, 1024, T * NH, nullptr, nullptr, 1.f);
       k_flash_attn<<<dim3((T + 63) / 64, NH), 128>>>(q_, (const __half*)kc_host_[slot][d_seq0_], (const __half*)vc_host_[slot][d_seq0_], bias_tab_, sinks_, gate_, d_pos_, T, NH, NKV, cap, swa ? c.n_swa : 0, att_);
     });
+  } else if (fast) {
+    const int ns = swa ? 4 : 16;
+    timed(swa ? "attn_local" : "attn_global", [&] {
+      k_attn_dec<<<dim3(NKV, ns), 128>>>(q_, r_, sinks_, (const __half* const*)kc_tab_[slot], (const __half* const*)vc_tab_[slot], Ly.rel_bias, d_seq_, d_pos_, NH, ns, cap, swa ? c.n_swa : 0, pm_, pl_, pacc_);
+      k_attn_combine<<<NH, 128>>>(pm_, pl_, pacc_, gate_, att_, NH, D, ns); });
   } else
   {
   timed(swa ? "attn_local" : "attn_global", [&] {

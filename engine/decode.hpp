@@ -107,6 +107,41 @@ __global__ void k_route_lists1(const float* logits, const float* bias, int NE, i
   }
 }
 
+// ---- single-token attention. grid (NKV, nsplit), 128 threads = 4 waves. A wave takes one key at a time: lane l holds dims 4l..4l+3 of the K row
+// (one coalesced 256-byte row per wave), the three query heads that share this KV head are reduced together. logit = q.k*scale + bias[dist] - sink
+// (the bias and sink shares are added to each lane's partial before the wave reduction). Partials (m, l, acc[128]) per (head, split) go to the same
+// buffers as k_attn_part, so k_attn_combine finishes the job (sink logit 0, output gate).
+__global__ __launch_bounds__(128) void k_attn_dec(const float* q, const float* r, const float* sinks, const __half* const* kc, const __half* const* vc, const float* relbias,
+                                                   const int* seq, const int* pos, int NH, int nsplit, int cap, int window, float* pm, float* pl, float* pacc) {
+  __shared__ float sm[4][3], sl[4][3], sa[4][3][128];
+  const int g = blockIdx.x, sp = blockIdx.y, wave = threadIdx.x >> 5, lane = threadIdx.x & 31, p = pos[0], KVD = 8 * 128;
+  const int grp = NH / 8; const __half* kb = kc[seq[0]]; const __half* vb = vc[seq[0]];
+  const int jlo = window ? max(0, p - window + 1) : 0; const int len = p + 1 - jlo;
+  const int chunk = window ? (len + nsplit - 1) / nsplit : max(2048, (p + 1 + nsplit - 1) / nsplit);
+  const int j0 = jlo + sp * chunk, j1 = min(p + 1, j0 + chunk); const float scale = rsqrtf(128.f);
+  float qv[3][4], rv[3], sk[3], m[3], l[3], acc[3][4];
+  for (int h = 0; h < 3; ++h) {
+    const int hh = g * grp + h; for (int d = 0; d < 4; ++d) qv[h][d] = q[(size_t)hh * 128 + lane * 4 + d] * scale;
+    rv[h] = r[(size_t)hh * 16 + (lane & 15)]; sk[h] = sinks[hh] * (1.f / 32.f); m[h] = -1e30f; l[h] = 0.f; for (int d = 0; d < 4; ++d) acc[h][d] = 0.f;
+  }
+  for (int j = j0 + wave; j < j1; j += 4) {
+    const size_t row = (size_t)(j % cap) * KVD + (size_t)g * 128 + lane * 4; const uint2 kr = *(const uint2*)(kb + row); const uint2 vr = *(const uint2*)(vb + row);
+    const __half* kh = (const __half*)&kr; const __half* vh = (const __half*)&vr; float kf[4], vf[4]; for (int d = 0; d < 4; ++d) { kf[d] = __half2float(kh[d]); vf[d] = __half2float(vh[d]); }
+    const int dist = p - j; const float rb = dist < 1024 ? relbias[(size_t)dist * 16 + (lane & 15)] : 0.f;
+    float s[3];
+    for (int h = 0; h < 3; ++h) { float part = qv[h][0] * kf[0] + qv[h][1] * kf[1] + qv[h][2] * kf[2] + qv[h][3] * kf[3] + 0.5f * rb * rv[h] - sk[h]; s[h] = wave_sum(part); }
+    for (int h = 0; h < 3; ++h) { const float mn = fmaxf(m[h], s[h]), c = expf(m[h] - mn), w = expf(s[h] - mn); l[h] = l[h] * c + w; for (int d = 0; d < 4; ++d) acc[h][d] = acc[h][d] * c + w * vf[d]; m[h] = mn; }
+  }
+  for (int h = 0; h < 3; ++h) { if (lane == 0) { sm[wave][h] = m[h]; sl[wave][h] = l[h]; } for (int d = 0; d < 4; ++d) sa[wave][h][lane * 4 + d] = acc[h][d]; }
+  __syncthreads();
+  const int t = threadIdx.x;   // one dim per thread: merge the 4 waves
+  for (int h = 0; h < 3; ++h) {
+    float M = -1e30f; for (int w = 0; w < 4; ++w) M = fmaxf(M, sm[w][h]);
+    float L = 0.f, A = 0.f; for (int w = 0; w < 4; ++w) { const float e = expf(sm[w][h] - M); L += sl[w][h] * e; A += sa[w][h][t] * e; }
+    const size_t o = ((size_t)(g * grp + h) * nsplit + sp); pacc[o * 128 + t] = A; if (t == 0) { pm[o] = L > 0.f ? M : -1e30f; pl[o] = L; }
+  }
+}
+
 // ---- single-token MoE, pair-major: one block row per chosen expert instead of launching all 128 experts' (mostly empty) blocks
 template <int WT>
 __global__ void k_moe_gu1(const uint8_t* W, int K, int NF, const float* X, const int* ids, const float* scales, float* hid, float beta, float lin) {

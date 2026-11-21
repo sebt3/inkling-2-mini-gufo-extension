@@ -1,5 +1,5 @@
 // GPU engine test harness: feed token ids (in chunks), write logits and optional per-tensor dumps, same layout as inkling_ref.
-// usage: inkling_gpu MODEL TOKENS OUT.bin [--chunk N] [--ctx N] [--dump DIR] [--topk N] [--force-experts DIR]
+// usage: inkling_gpu MODEL TOKENS OUT.bin [--chunk N] [--ctx N] [--dump DIR] [--topk N] [--force-experts DIR] [--decode N]
 #include <chrono>
 #include <map>
 #include <numeric>
@@ -9,8 +9,8 @@
 using namespace inkling::gpu;
 int main(int argc, char** argv) {
   if (argc < 4) { fprintf(stderr, "usage: %s MODEL TOKENS OUT [--chunk N] [--ctx N] [--dump DIR] [--topk N]\n", argv[0]); return 2; }
-  int chunk = 1, ctx = 8192, topk = 3; std::string dump, force;
-  for (int i = 4; i < argc; ++i) { std::string a = argv[i]; if (a == "--chunk") chunk = atoi(argv[++i]); else if (a == "--ctx") ctx = atoi(argv[++i]); else if (a == "--dump") dump = argv[++i]; else if (a == "--topk") topk = atoi(argv[++i]); else if (a == "--force-experts") force = argv[++i]; }
+  int chunk = 1, ctx = 8192, topk = 3, ndec = 0; std::string dump, force;
+  for (int i = 4; i < argc; ++i) { std::string a = argv[i]; if (a == "--chunk") chunk = atoi(argv[++i]); else if (a == "--ctx") ctx = atoi(argv[++i]); else if (a == "--dump") dump = argv[++i]; else if (a == "--topk") topk = atoi(argv[++i]); else if (a == "--force-experts") force = argv[++i]; else if (a == "--decode") ndec = atoi(argv[++i]); }
   std::vector<int> toks; { FILE* f = fopen(argv[2], "r"); int t; while (fscanf(f, "%d", &t) == 1) toks.push_back(t); fclose(f); }
   auto t0 = std::chrono::steady_clock::now();
   Engine eng(argv[1], ctx);
@@ -42,4 +42,11 @@ int main(int argc, char** argv) {
   }
   double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
   fprintf(stderr, "%zu tokens in %.2fs (%.1f tok/s)\n", toks.size(), dt, toks.size() / dt); fclose(out);
+  if (ndec > 0) {   // greedy single-token decoding after the prompt, at that depth
+    std::vector<float> lg; { Batch b; b.tokens.push_back(toks.back()); b.seq.push_back(0); b.pos.push_back((int)toks.size() - 1); b.want_logits.push_back(0); lg = eng.step(b); }
+    int pos = (int)toks.size(); auto t1 = std::chrono::steady_clock::now();
+    for (int i = 0; i < ndec; ++i) { int best = 0; for (size_t k = 1; k < lg.size(); ++k) if (lg[k] > lg[best]) best = (int)k;
+      Batch b; b.tokens.push_back(best); b.seq.push_back(0); b.pos.push_back(pos++); b.want_logits.push_back(0); lg = eng.step(b); }
+    double d2 = std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count(); fprintf(stderr, "decode at depth %zu: %d tokens in %.2fs (%.1f tok/s)\n", toks.size(), ndec, d2, ndec / d2);
+  }
 }
