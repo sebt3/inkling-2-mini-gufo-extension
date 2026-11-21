@@ -10,7 +10,7 @@ POD=${POD:-inkling-dev}; NS=kydah-llms
 # TREE selects the synced copy on the node and the build dir in the pod (several worktrees can coexist)
 TREE=${TREE:-src}; BUILD=/tmp/build-$TREE
 case "${1:-}" in
-  sync) tar --exclude=.git --exclude=build -cf - . | ssh infra-worker04 'rm -rf /var/tmp/inkling-ext/$TREE && mkdir -p /var/tmp/inkling-ext/$TREE && tar -xf - -C /var/tmp/inkling-ext/$TREE' ;;
+  sync) tar --exclude=.git --exclude=build -cf - . | ssh infra-worker04 "set -e; test -n '$TREE'; rm -rf /var/tmp/inkling-ext/$TREE && mkdir -p /var/tmp/inkling-ext/$TREE && tar -xf - -C /var/tmp/inkling-ext/$TREE" ;;
   run) shift; { cat tools/env.sh; echo "export TREE=$TREE BUILD=$BUILD SRC=/src/$TREE"; cat; } | ssh infra-m1 "sudo -i kubectl -n $NS exec -i $POD -c dev -- bash -s" ;;
   build-ref) "$0" run <<'X'
 cd $SRC && mkdir -p $BUILD && g++ -O3 -march=native -fopenmp -std=c++20 -o $BUILD/inkling_ref tools/inkling_ref.cpp 2>&1 | head -40
