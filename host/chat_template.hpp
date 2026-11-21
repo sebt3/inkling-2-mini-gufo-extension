@@ -6,11 +6,21 @@
 #include <string>
 #include <vector>
 
+#include "json.hpp"
+
 namespace inkling {
 
 struct ContentPart {
   std::string type;  // only "text" is accepted by this renderer
   std::string text;
+};
+
+struct ToolCall {
+  std::string id;                        // empty when the call has no id
+  std::string name;
+  // Arguments as the template receives them: an object (the usual case). A JSON string is parsed first, as the
+  // server does. Absent (nullopt) is an error, null renders as no arguments.
+  std::optional<json::Value> arguments;
 };
 
 struct Message {
@@ -22,6 +32,8 @@ struct Message {
   std::vector<ContentPart> parts;      // when content == Parts
   std::string reasoning_content;       // assistant thinking, empty when none
   std::string name;                    // optional; tool name for tool messages, name suffix for assistant
+  std::vector<ToolCall> tool_calls;    // assistant only
+  std::string tool_call_id;            // tool messages only; the name is looked up in earlier tool calls
 
   static Message make(std::string role, std::string text) {
     Message m;
@@ -42,6 +54,10 @@ struct Options {
   // and also none, which the template maps to 0). reasoning_effort_value is a number in [0.0, 0.99].
   std::optional<std::string> reasoning_effort;
   std::optional<double> reasoning_effort_value;
+
+  // Tool definitions, in the OpenAI shape: {"type": "function", "function": {"name", "description", "parameters"}}.
+  // Empty means no tools: the prompt is then identical to the one without this field.
+  std::vector<json::Value> tools;
 };
 
 // Renders the full prompt. Throws std::invalid_argument where the template calls raise_exception or where

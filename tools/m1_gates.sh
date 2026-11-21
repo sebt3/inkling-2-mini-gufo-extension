@@ -41,7 +41,7 @@ if [[ $which == all || $which == template ]]; then
   python3 gates/template_gate.py gen > "$WORK/tpl_cases.jsonl"
   {
     echo "cat > /tmp/tpl_cases.jsonl <<'CASES_EOF'"; cat "$WORK/tpl_cases.jsonl"; echo "CASES_EOF"
-    echo "cd \$SRC && g++ -O2 -std=c++20 -Wall -Wextra -o \$BUILD/template_probe tools/template_probe.cpp host/chat_template.cpp"
+    echo "cd \$SRC && g++ -O2 -std=c++20 -Wall -Wextra -o \$BUILD/template_probe tools/template_probe.cpp host/chat_template.cpp host/json.cpp"
     echo "\$BUILD/template_probe < /tmp/tpl_cases.jsonl"
   } > "$WORK/run_tpl.sh"
   tools/dev.sh sync
