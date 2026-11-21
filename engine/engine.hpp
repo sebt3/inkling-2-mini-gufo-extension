@@ -97,6 +97,7 @@ class Engine {
     return n + private_bytes();
   }
   size_t weight_bytes() const { return weight_bytes_; }
+  int max_ctx() const { return max_ctx_; }
   std::mutex mu;  // serialises step(): one device stream
 
   // run one batch; returns logits (n_vocab_unpadded each) for batch.want_logits
