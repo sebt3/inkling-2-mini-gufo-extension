@@ -1,5 +1,12 @@
 # inkling-2-mini: Gufo extension
 
+> **Deprecated.** Use [headbouyJB/inkling2-gufo](https://github.com/headbouyJB/inkling2-gufo) instead (Gufo 0.35.0, API 0.3.20). On the same
+> machine and model files it decodes at 42-46 tok/s (this extension: ~30), prefills at ~1000 tok/s (this one: ~600), batches 4 sessions
+> to 79 tok/s on UD-Q4_K_XL (this one: 56), and gave the same output as this extension on chat, reasoning, tool calls (including
+> `tool_choice: required`), streaming and vision. This repository stays as a reference (CPU reference forward, oracle gates, notes on the
+> model's architecture); `v0.1.0` is the last release. DSpark is implemented here only, and it was slower than plain decoding.
+
+
 [Gufo](https://github.com/gufo-org/gufo) text-generation extension for Thinking Machines' **Inkling-2-Mini**
 (26B total, 3.4B active, looped MoE, GGUF architecture `inkling2_loop`), written for AMD gfx1151 (Strix Halo, HIP).
 
